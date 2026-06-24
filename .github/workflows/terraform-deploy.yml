@@ -1,0 +1,231 @@
+name: Terraform Deploy
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "terraform/**"
+      - "**/*.tf"
+      - "**/*.tfvars"
+      - "flyway/**"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: read
+  issues: write
+
+env:
+  AWS_REGION: us-east-2
+
+  # First-run Tier 1 backend bootstrap is not performed automatically by this workflow.
+  # New repos must have their backend prerequisites created before normal deploy runs.
+  TF_BACKEND_BOOTSTRAP_REQUIRED_MESSAGE: "Remote Terraform backend must exist before Terraform Deploy can run successfully."
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check deploy trigger overlay
+        if: github.event_name == 'push'
+        id: overlay_check
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVERLAY="deploy-trigger.overlay.json"
+          if [ ! -f "$OVERLAY" ]; then
+            echo "No deploy-trigger.overlay.json found — proceeding with gatedPush behavior"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          MODE=$(jq -r '.mode // "gatedPush"' "$OVERLAY")
+          echo "Deploy trigger mode: $MODE"
+          if [ "$MODE" = "manualOnly" ]; then
+            echo "Mode is manualOnly — skipping push-triggered deploy. Use workflow_dispatch to deploy."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: hashicorp/setup-terraform@v3
+        if: steps.overlay_check.outputs.skip != 'true'
+        with:
+          terraform_version: 1.6.6
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.overlay_check.outputs.skip != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Validate backend bootstrap expectation
+        if: steps.overlay_check.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${TF_BACKEND_BOOTSTRAP_REQUIRED_MESSAGE}"
+          echo "This canonical workflow assumes the S3 backend bucket and lock table already exist."
+          echo "If this is a brand-new Tier 1 repo, complete backend bootstrap first, then rerun deploy."
+
+      - name: Terraform Deploy
+        if: steps.overlay_check.outputs.skip != 'true'
+        id: deploy
+        run: |
+          terraform init
+
+          # Load optional var files from terraform-vars.overlay.json
+          # Format: ["env/dev.tfvars", ...] — paths relative to terraform/ working directory
+          # Empty array [] is a no-op. File absence is also safe.
+          VAR_FILE_ARGS=()
+          if [ -f terraform-vars.overlay.json ]; then
+            echo "Loading var files from terraform-vars.overlay.json..."
+            while IFS= read -r f; do
+              echo "  Adding -var-file=$f"
+              VAR_FILE_ARGS+=("-var-file=$f")
+            done < <(jq -r '.[]' terraform-vars.overlay.json)
+          fi
+
+          terraform apply -auto-approve "${VAR_FILE_ARGS[@]}"
+
+      - name: Resolve Flyway connection details
+        if: steps.overlay_check.outputs.skip != 'true' && steps.deploy.outcome == 'success' && hashFiles('flyway/sql/*.sql') != ''
+        id: flyway_resolve
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          OVERLAY="flyway.overlay.json"
+          if [ ! -f "$OVERLAY" ]; then
+            echo "No flyway.overlay.json found — skipping Flyway"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CLIENT=$(jq -r '.client // empty' "$OVERLAY")
+          if [ -z "$CLIENT" ]; then
+            echo "flyway.overlay.json has no client key — skipping Flyway"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          case "$CLIENT" in
+            DSG)
+              echo "bastion=i-06f8112c568d8afa4" >> "$GITHUB_OUTPUT"
+              echo "db_host=axiom-rds.c12404wg0jbg.us-east-2.rds.amazonaws.com" >> "$GITHUB_OUTPUT"
+              echo "db_name=postgres" >> "$GITHUB_OUTPUT"
+              SECRET_ARN="arn:aws:secretsmanager:us-east-2:193527004156:secret:rds!db-0cae1482-27e2-4f32-9e7a-26ed5dcfeb08-CAKrOD"
+              ;;
+            FPC)
+              echo "bastion=i-07ba250380758a779" >> "$GITHUB_OUTPUT"
+              echo "db_host=fpc-data-lake.crecs6i40087.us-east-2.rds.amazonaws.com" >> "$GITHUB_OUTPUT"
+              echo "db_name=fpc_data_lake" >> "$GITHUB_OUTPUT"
+              SECRET_ARN="arn:aws:secretsmanager:us-east-2:604860202807:secret:rds!db-c79b93bd-346b-442d-8ea2-01cd14361de4-r3eHNC"
+              ;;
+            *)
+              echo "ERROR: Unknown client '$CLIENT' in flyway.overlay.json"
+              exit 1
+              ;;
+          esac
+
+          SECRET_JSON=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" --query SecretString --output text)
+          DB_USER=$(echo "$SECRET_JSON" | jq -r '.username')
+          DB_PASS=$(echo "$SECRET_JSON" | jq -r '.password')
+          echo "::add-mask::$DB_PASS"
+          echo "db_user=$DB_USER" >> "$GITHUB_OUTPUT"
+          echo "db_password=$DB_PASS" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Run Flyway migrations
+        if: steps.flyway_resolve.conclusion == 'success' && steps.flyway_resolve.outputs.skip != 'true'
+        uses: ./.github/actions/flyway-migrate
+        with:
+          bastion-instance-id: ${{ steps.flyway_resolve.outputs.bastion }}
+          db-host: ${{ steps.flyway_resolve.outputs.db_host }}
+          db-port: '5432'
+          db-name: ${{ steps.flyway_resolve.outputs.db_name }}
+          db-user: ${{ steps.flyway_resolve.outputs.db_user }}
+          db-password: ${{ steps.flyway_resolve.outputs.db_password }}
+          aws-region: 'us-east-2'
+
+      - name: Provision SSM from Terraform outputs (repo-specific overlay)
+        if: steps.overlay_check.outputs.skip != 'true' && steps.deploy.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f ssm-outputs.json ]; then
+            echo "No ssm-outputs.json found — skipping SSM output provisioning"
+            exit 0
+          fi
+          OUTPUTS=$(terraform output -json)
+          echo "Provisioning SSM parameters from terraform outputs..."
+          jq -c '.[]' ssm-outputs.json | while read -r entry; do
+            TF_KEY=$(echo "$entry" | jq -r '.output')
+            SSM_NAME=$(echo "$entry" | jq -r '.ssm')
+            SSM_TYPE=$(echo "$entry" | jq -r '.type // "String"')
+            VALUE=$(echo "$OUTPUTS" | jq -r --arg k "$TF_KEY" '.[$k].value // empty')
+            if [ -z "$VALUE" ]; then
+              echo "  WARN: terraform output '$TF_KEY' is empty or missing — skipping $SSM_NAME"
+              continue
+            fi
+            aws ssm put-parameter --name "$SSM_NAME" --value "$VALUE" --type "$SSM_TYPE" --overwrite || exit 1
+            echo "  Set $SSM_NAME (from tf output: $TF_KEY)"
+          done
+
+      - name: Provision SSM from Secrets Manager (repo-specific overlay)
+        if: steps.overlay_check.outputs.skip != 'true' && steps.deploy.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ ! -f ssm-secrets.json ]; then
+            echo "No ssm-secrets.json found — skipping SSM secrets provisioning"
+            exit 0
+          fi
+          echo "Provisioning SSM SecureString parameters from Secrets Manager..."
+          jq -c '.[]' ssm-secrets.json | while read -r entry; do
+            SSM_NAME=$(echo "$entry" | jq -r '.ssm')
+            SECRET_ARN=$(echo "$entry" | jq -r '.source_secret_arn')
+            FIELD=$(echo "$entry" | jq -r '.source_key')
+            VALUE=$(aws secretsmanager get-secret-value --secret-id "$SECRET_ARN" \
+              --query SecretString --output text | \
+              FIELD="$FIELD" python3 -c 'import sys,json,os; print(json.load(sys.stdin)[os.environ["FIELD"]])')
+            aws ssm put-parameter --name "$SSM_NAME" --value "$VALUE" --type SecureString --overwrite || exit 1
+            echo "  Set $SSM_NAME (from Secrets Manager field: $FIELD)"
+          done
+
+      - name: Signal lifecycle (repository_dispatch)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            try {
+              const owner = context.repo.owner;
+              const repo = context.repo.repo;
+              const sha = context.sha;
+              const conclusion = '${{ steps.deploy.outcome }}' === 'success' ? 'success' : 'failure';
+
+              // Collect linked issue numbers from associated PRs
+              const prsResp = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                owner, repo, commit_sha: sha,
+                headers: { accept: 'application/vnd.github.groot-preview+json' }
+              });
+              const issueNumbers = new Set();
+              for (const pr of prsResp.data) {
+                const matches = (pr.body || '').match(/#(\d+)/g) || [];
+                matches.forEach(m => issueNumbers.add(parseInt(m.slice(1))));
+              }
+
+              await github.rest.repos.createDispatchEvent({
+                owner, repo,
+                event_type: 'lifecycle-deploy-signal',
+                client_payload: { set_id: 'terraform_deploy', conclusion: conclusion, sha: sha, issue_numbers: [...issueNumbers] }
+              });
+              console.log('lifecycle-deploy-signal dispatched: set_id=terraform_deploy conclusion=' + conclusion + ' sha=' + sha);
+            } catch (e) { console.log('Signal dispatch error (non-fatal): ' + e.message); }
