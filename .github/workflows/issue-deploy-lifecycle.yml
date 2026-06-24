@@ -1,0 +1,1050 @@
+name: Issue Deploy Lifecycle
+
+# DETERMINISTIC RECONCILER — called only via workflow_call from lifecycle-bootstrap.yml.
+# Recomputes correct issue state from repository facts on every invocation.
+# Never relies on event ordering; safe to re-run at any time for self-healing.
+# Issues are NEVER closed automatically — manual closure is always required.
+
+on:
+  workflow_call:
+    inputs:
+      event_name:
+        description: 'Triggering event name (pull_request | push | workflow_run | workflow_dispatch)'
+        required: true
+        type: string
+      pr_number:
+        description: 'PR number (pull_request events)'
+        required: false
+        type: string
+        default: ''
+      pr_merged:
+        description: 'Whether the PR was merged (pull_request events)'
+        required: false
+        type: string
+        default: ''
+      push_sha:
+        description: 'Commit SHA pushed to main (push events)'
+        required: false
+        type: string
+        default: ''
+      workflow_run_name:
+        description: 'Completed workflow name (workflow_run events)'
+        required: false
+        type: string
+        default: ''
+      workflow_run_conclusion:
+        description: 'Completed workflow conclusion (workflow_run events)'
+        required: false
+        type: string
+        default: ''
+      workflow_run_sha:
+        description: 'Head SHA for the completed workflow run (workflow_run events)'
+        required: false
+        type: string
+        default: ''
+      dispatch_set_id:
+        description: 'Canonical set ID from repository_dispatch lifecycle-deploy-signal'
+        required: false
+        type: string
+        default: ''
+      dispatch_conclusion:
+        description: 'success or failure from repository_dispatch lifecycle-deploy-signal'
+        required: false
+        type: string
+        default: ''
+      dispatch_sha:
+        description: 'Merge/head SHA from repository_dispatch lifecycle-deploy-signal'
+        required: false
+        type: string
+        default: ''
+      dispatch_issue_numbers:
+        description: 'JSON array of linked issue numbers from repository_dispatch lifecycle-deploy-signal'
+        required: false
+        type: string
+        default: '[]'
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: write
+  actions: read
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reconcile issue lifecycle state
+        uses: actions/github-script@v7
+        env:
+          INPUT_EVENT_NAME: ${{ inputs.event_name }}
+          INPUT_PR_NUMBER: ${{ inputs.pr_number }}
+          INPUT_PR_MERGED: ${{ inputs.pr_merged }}
+          INPUT_PUSH_SHA: ${{ inputs.push_sha }}
+          INPUT_WF_RUN_NAME: ${{ inputs.workflow_run_name }}
+          INPUT_WF_RUN_CONCLUSION: ${{ inputs.workflow_run_conclusion }}
+          INPUT_WF_RUN_SHA: ${{ inputs.workflow_run_sha }}
+          INPUT_DISPATCH_SET_ID: ${{ inputs.dispatch_set_id }}
+          INPUT_DISPATCH_CONCLUSION: ${{ inputs.dispatch_conclusion }}
+          INPUT_DISPATCH_SHA: ${{ inputs.dispatch_sha }}
+          INPUT_DISPATCH_ISSUE_NUMBERS: ${{ inputs.dispatch_issue_numbers }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo  = context.repo.repo;
+
+            const eventName       = process.env.INPUT_EVENT_NAME        || '';
+            const prNumber        = parseInt(process.env.INPUT_PR_NUMBER)  || 0;
+            const prMerged        = process.env.INPUT_PR_MERGED === 'true';
+            const pushSha         = process.env.INPUT_PUSH_SHA            || '';
+            const wfRunName       = process.env.INPUT_WF_RUN_NAME         || '';
+            const wfRunConclusion = process.env.INPUT_WF_RUN_CONCLUSION   || '';
+            const wfRunSha        = process.env.INPUT_WF_RUN_SHA          || '';
+            const dispatchSetId   = process.env.INPUT_DISPATCH_SET_ID     || '';
+            const dispatchConclusion = process.env.INPUT_DISPATCH_CONCLUSION || '';
+            const dispatchSha     = process.env.INPUT_DISPATCH_SHA        || '';
+            const dispatchIssueNums = (() => {
+              try { return JSON.parse(process.env.INPUT_DISPATCH_ISSUE_NUMBERS || '[]'); } catch { return []; }
+            })();
+
+            // ── Emoji constants ──────────────────────────────────────────────
+            const BLUE   = String.fromCodePoint(0x1F535);
+            const GREEN  = String.fromCodePoint(0x1F7E2);
+            const RED    = String.fromCodePoint(0x1F534);
+            const PURPLE = String.fromCodePoint(0x1F7E3);
+            const BLACK  = String.fromCodePoint(0x26AB);
+
+            const TOKEN_PAT = new RegExp(
+              '^[' + BLUE + GREEN + RED + PURPLE + BLACK + ']?\\s*' +
+              '\\[(AGENT:(IN-PROGRESS|NEEDS-REVIEW|BLOCKED|DONE|DEPLOYING)|DEPLOYMENT COMPLETE|DEPLOYMENT BLOCKED|DEPLOYMENT FAILED|DEPLOYMENT:FAILED|DEPLOYMENT:BLOCKED)\\]\\s*',
+              'iu'
+            );
+            // Fallback: strip any leading "<maybe-emoji> [TAG]" prefix, even tags we don't
+            // recognize (e.g. manually-applied [AGENT:PLAN-REVIEW], or prefixes written by
+            // other tooling). This prevents new lifecycle prefixes from being prepended on
+            // top of foreign ones, which would produce stacked titles like
+            // "⚫ [DEPLOYMENT COMPLETE] 🟡 [AGENT:PLAN-REVIEW] Original title".
+            //
+            // Heuristic: leading bracketed tag of <= 40 chars (no brackets inside), optionally
+            // preceded by a single emoji-like char and whitespace. Safe because legitimate
+            // issue titles do not start with "[...]".
+            const FALLBACK_TAG_PAT = /^\s*\p{Extended_Pictographic}?\s*\[[^\[\]]{1,40}\]\s*/u;
+            const stripAllPrefixes = (t) => {
+              let s = t;
+              // First strip all recognized lifecycle prefixes (narrow, safe).
+              while (TOKEN_PAT.test(s)) { s = s.replace(TOKEN_PAT, ''); }
+              // Then strip any remaining foreign bracketed prefixes (broad, defensive).
+              while (FALLBACK_TAG_PAT.test(s)) { s = s.replace(FALLBACK_TAG_PAT, ''); }
+              return s.trim();
+            };
+
+            function matchGlob(pattern, filePath) {
+              const escaped = pattern
+                .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+                .replace(/\*\*/g, '\u0000')
+                .replace(/\*/g, '[^/]*')
+                .replace(/\u0000/g, '.*');
+              return new RegExp('^' + escaped + '$').test(filePath);
+            }
+
+            function allFilesMatchAnyPattern(filePaths, patterns) {
+              if (!Array.isArray(filePaths) || filePaths.length === 0) return false;
+              if (!Array.isArray(patterns) || patterns.length === 0) return false;
+              return filePaths.every(f => patterns.some(p => matchGlob(p, f)));
+            }
+
+            function parseMetadata(body) {
+              if (!body.startsWith('DSG-LIFECYCLE:')) return null;
+              const meta = {};
+              for (const line of body.split('\n').slice(1)) {
+                const idx = line.indexOf(': ');
+                if (idx !== -1) meta[line.slice(0, idx).trim()] = line.slice(idx + 2).trim();
+              }
+              return meta;
+            }
+
+            // Extract GitHub closing-keyword issue references from a PR body.
+            //
+            // Matches only the documented closing keywords followed by #N:
+            //   close | closes | closed | closing
+            //   fix   | fixes  | fixed  | fixing
+            //   resolve | resolves | resolved | resolving
+            //
+            // Critically does NOT match bare #N references in prose (e.g.
+            // "see #5 for context" or "compute #4"), which the previous
+            // /#(\d+)/g regex incorrectly swept in. Those false matches caused
+            // the reconciler to stamp lifecycle prefixes on unrelated open
+            // issues whenever a merged PR's body happened to mention their
+            // numbers in narrative text.
+            //
+            // Returns a deduplicated array of issue numbers (integers).
+            function parseClosingKeywordIssues(body) {
+              if (!body) return [];
+              const pattern = /\b(?:close[sd]?|closing|fix(?:e[sd])?|fixing|resolve[sd]?|resolving)\b\s*:?\s+#(\d+)\b/gi;
+              const nums = [];
+              let m;
+              while ((m = pattern.exec(body)) !== null) {
+                const n = parseInt(m[1], 10);
+                if (n > 0) nums.push(n);
+              }
+              return [...new Set(nums)];
+            }
+
+            function mergeConfigs(core, overlay) {
+              if (!overlay) return core;
+              return {
+                version: 3,
+                mode: core.mode || 'changed_paths',
+                sets: { ...(core.sets || {}), ...(overlay.sets || {}) },
+                path_rules: [...(core.path_rules || []), ...(overlay.path_rules || [])],
+                no_deploy_paths: [
+                  ...((core.no_deploy_paths || [])),
+                  ...((overlay.no_deploy_paths || []))
+                ]
+              };
+            }
+
+            async function loadLifecycleConfig() {
+              let core = null;
+              try {
+                const { data: f } = await github.rest.repos.getContent({
+                  owner, repo, path: '.github/deploy-lifecycle.core.json'
+                });
+                core = JSON.parse(Buffer.from(f.content, 'base64').toString('utf8'));
+              } catch (e) {
+                try {
+                  const { data: f } = await github.rest.repos.getContent({
+                    owner, repo, path: '.github/deploy-lifecycle.json'
+                  });
+                  console.log('Using legacy .github/deploy-lifecycle.json');
+                  return JSON.parse(Buffer.from(f.content, 'base64').toString('utf8'));
+                } catch (e2) {
+                  console.log('No lifecycle config found; treating as no deploy required.');
+                  return null;
+                }
+              }
+              let overlay = null;
+              try {
+                const { data: f } = await github.rest.repos.getContent({
+                  owner, repo, path: '.github/deploy-lifecycle.overlay.json'
+                });
+                overlay = JSON.parse(Buffer.from(f.content, 'base64').toString('utf8'));
+                console.log('Merged deploy-lifecycle.core.json + deploy-lifecycle.overlay.json');
+              } catch (e) {
+                console.log('No overlay config; using core only.');
+              }
+              return mergeConfigs(core, overlay);
+            }
+
+            async function computeDeployRequirements(prNum) {
+              const cfg = await loadLifecycleConfig();
+              if (!cfg) return { isV3: false, items: [] };
+              const ver = cfg.version || 1;
+              let changedPaths = [];
+              if (ver >= 2 && cfg.mode === 'changed_paths') {
+                try {
+                  const r = await github.rest.pulls.listFiles({ owner, repo, pull_number: prNum, per_page: 100 });
+                  changedPaths = r.data.map(f => f.filename);
+                  console.log(`Changed files (${changedPaths.length}): ${changedPaths.join(', ')}`);
+                } catch (e) {
+                  console.log(`Failed to list PR files: ${e.message}`);
+                }
+              }
+              if (ver >= 3 && cfg.mode === 'changed_paths') {
+                const noDeployPaths = cfg.no_deploy_paths || [];
+                if (allFilesMatchAnyPattern(changedPaths, noDeployPaths)) {
+                  console.log(`All changed files matched no_deploy_paths; no deploy required.`);
+                  return { isV3: true, items: [] };
+                }
+                const matched = new Set();
+                for (const rule of (cfg.path_rules || [])) {
+                  if ((rule.paths || []).some(p => changedPaths.some(f => matchGlob(p, f)))) {
+                    (rule.sets || []).forEach(s => matched.add(s));
+                  }
+                }
+                const result = [...matched];
+                console.log(`Path-routed required sets (v3): ${JSON.stringify(result)}`);
+                return { isV3: true, items: result };
+              }
+              if (ver >= 2 && cfg.mode === 'changed_paths') {
+                const matched = new Set();
+                for (const rule of (cfg.path_rules || [])) {
+                  if ((rule.paths || []).some(p => changedPaths.some(f => matchGlob(p, f)))) {
+                    (rule.workflows || []).forEach(w => matched.add(w));
+                  }
+                }
+                const result = [...matched];
+                console.log(`Path-routed expected workflows (v2): ${JSON.stringify(result)}`);
+                return { isV3: false, items: result };
+              }
+              const wfs = (cfg.deploy_workflows || []).map(w => w.name);
+              return { isV3: false, items: wfs };
+            }
+
+            function findSetsForWorkflow(cfg, workflowName) {
+              const sets = cfg.sets || {};
+              return Object.entries(sets)
+                .filter(([, setDef]) => (setDef.workflows || []).includes(workflowName))
+                .map(([setId]) => setId);
+            }
+
+            async function computeSetResolution(cfg, requiredSets, sha, extraSucceededWorkflows = []) {
+              const [succResp, failResp] = await Promise.all([
+                github.rest.actions.listWorkflowRunsForRepo({ owner, repo, head_sha: sha, status: 'success', per_page: 100 }),
+                github.rest.actions.listWorkflowRunsForRepo({ owner, repo, head_sha: sha, status: 'failure', per_page: 100 })
+              ]);
+              const succeededNames = new Set([
+                ...succResp.data.workflow_runs.map(r => r.name),
+                ...extraSucceededWorkflows
+              ]);
+              const failedNames = new Set(failResp.data.workflow_runs.map(r => r.name));
+              const setsDef = cfg.sets || {};
+              const completed = [], blocked = [], pending = [];
+              for (const setId of requiredSets) {
+                const wfs = (setsDef[setId] || {}).workflows || [];
+                // Set complete ONLY when ALL workflows succeeded
+                if (wfs.every(w => succeededNames.has(w))) { completed.push(setId); continue; }
+                // Blocked if ANY workflow failed and has not been re-run successfully
+                if (wfs.some(w => failedNames.has(w) && !succeededNames.has(w))) { blocked.push(setId); continue; }
+                pending.push(setId);
+              }
+              return { completed, blocked, pending };
+            }
+
+            async function getLinkedIssues(prNum) {
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNum });
+              return parseClosingKeywordIssues(pr.body || '');
+            }
+
+            async function setDeploying(issueNum, prNum, mergeSha, headSha, requirements) {
+              const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNum });
+              // Dedup: skip if DSG-LIFECYCLE metadata for this merge SHA already exists
+              const existingComments = await github.rest.issues.listComments({
+                owner, repo, issue_number: issueNum, per_page: 100
+              });
+              if (existingComments.data.some(c =>
+                c.body.startsWith('DSG-LIFECYCLE:') &&
+                (c.body.includes(`merge_sha: ${mergeSha}`) || c.body.includes(`head_sha: ${headSha}`))
+              )) {
+                console.log(`Issue #${issueNum}: DSG-LIFECYCLE metadata already posted for this SHA. Skipping duplicate setDeploying.`);
+                return;
+              }
+              const stripped  = stripAllPrefixes(issue.title);
+              const newTitle  = PURPLE + ' [AGENT:DEPLOYING] ' + stripped;
+              const reqKey    = requirements.isV3 ? 'required_sets' : 'expected_workflows';
+              const metaBody  = [
+                'DSG-LIFECYCLE:',
+                `repo: ${owner}/${repo}`,
+                `pr: ${prNum}`,
+                `merge_sha: ${mergeSha}`,
+                `head_sha: ${headSha}`,
+                `deploy_mode: changed_paths`,
+                `${reqKey}: ${JSON.stringify(requirements.items)}`,
+                `timestamp: ${new Date().toISOString()}`
+              ].join('\n');
+              await github.rest.issues.createComment({ owner, repo, issue_number: issueNum, body: metaBody });
+              await github.rest.issues.update({ owner, repo, issue_number: issueNum, title: newTitle });
+              console.log(`Issue #${issueNum}: set DEPLOYING; ${reqKey}: ${requirements.items.join(', ')}`);
+            }
+
+            async function setDeploymentComplete(issueNum, note) {
+              const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNum });
+              // Dedup: skip if already marked DEPLOYMENT COMPLETE
+              if (issue.title.includes('[DEPLOYMENT COMPLETE]')) {
+                console.log(`Issue #${issueNum}: already DEPLOYMENT COMPLETE. Skipping duplicate.`);
+                return;
+              }
+              const stripped = stripAllPrefixes(issue.title);
+              const newTitle = BLACK + ' [DEPLOYMENT COMPLETE] ' + stripped;
+              await github.rest.issues.update({ owner, repo, issue_number: issueNum, title: newTitle });
+              await github.rest.issues.createComment({ owner, repo, issue_number: issueNum, body: note });
+              console.log(`Issue #${issueNum}: DEPLOYMENT COMPLETE.`);
+            }
+
+            async function setDeploymentBlocked(issueNum, wfName, conclusion) {
+              const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNum });
+              // Dedup: skip if already marked DEPLOYMENT BLOCKED
+              if (issue.title.includes('[DEPLOYMENT BLOCKED]')) {
+                console.log(`Issue #${issueNum}: already DEPLOYMENT BLOCKED. Skipping duplicate.`);
+                return;
+              }
+              const stripped = stripAllPrefixes(issue.title);
+              const newTitle = RED + ' [DEPLOYMENT BLOCKED] ' + stripped;
+              await github.rest.issues.update({ owner, repo, issue_number: issueNum, title: newTitle });
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: issueNum,
+                body: `Deployment blocked: workflow "${wfName}" concluded with: ${conclusion}.`
+              });
+              console.log(`Issue #${issueNum}: DEPLOYMENT BLOCKED (${wfName}).`);
+            }
+
+            // ── Shared helper: reconcile a single BLOCKED/DEPLOYING issue ──
+            // Reads the issue's DSG-LIFECYCLE metadata comment to find its
+            // per-issue required_sets (v3) or expected_workflows (v2).
+            // Only checks those sets — not all sets in the repo config.
+            // Falls back to allSetIds only if no metadata is found.
+            async function reconcileBlockedIssue(issueNum, cfg) {
+              if (!cfg) { console.log(`Issue #${issueNum}: no config; skipping.`); return; }
+              const allSetIds = Object.keys(cfg.sets || {});
+              if (allSetIds.length === 0) { console.log(`Issue #${issueNum}: no sets defined; skipping.`); return; }
+
+              // Read the issue's comments to find its per-issue required_sets
+              let issueRequiredSets = null;
+              let issueExpectedWorkflows = null;
+              try {
+                const comments = await github.rest.issues.listComments({
+                  owner, repo, issue_number: issueNum, per_page: 100
+                });
+                // Walk comments in reverse to find the most recent DSG-LIFECYCLE metadata
+                for (const c of [...comments.data].reverse()) {
+                  if (!c.body.startsWith('DSG-LIFECYCLE:')) continue;
+                  const meta = parseMetadata(c.body);
+                  if (meta?.required_sets) {
+                    try { issueRequiredSets = JSON.parse(meta.required_sets); } catch {}
+                  } else if (meta?.expected_workflows) {
+                    try { issueExpectedWorkflows = JSON.parse(meta.expected_workflows); } catch {}
+                  }
+                  break;
+                }
+              } catch (e) {
+                console.log(`Issue #${issueNum}: failed to read comments: ${e.message}. Falling back to all sets.`);
+              }
+
+              // Determine which sets to check for this specific issue
+              let setsToCheck;
+              if (issueRequiredSets !== null && issueRequiredSets.length > 0) {
+                setsToCheck = issueRequiredSets;
+                console.log(`Issue #${issueNum}: using per-issue required_sets: ${JSON.stringify(setsToCheck)}`);
+              } else if (issueExpectedWorkflows !== null && issueExpectedWorkflows.length > 0) {
+                // v2 fallback: find which sets contain these workflow names
+                setsToCheck = [];
+                for (const wfName of issueExpectedWorkflows) {
+                  const matched = findSetsForWorkflow(cfg, wfName);
+                  setsToCheck.push(...matched);
+                }
+                setsToCheck = [...new Set(setsToCheck)];
+                if (setsToCheck.length === 0) setsToCheck = allSetIds;
+                console.log(`Issue #${issueNum}: mapped expected_workflows to sets: ${JSON.stringify(setsToCheck)}`);
+              } else {
+                setsToCheck = allSetIds;
+                console.log(`Issue #${issueNum}: no per-issue metadata found; falling back to all sets: ${JSON.stringify(setsToCheck)}`);
+              }
+
+              let headSha;
+              try {
+                const { data: refData } = await github.rest.git.getRef({ owner, repo, ref: 'heads/main' });
+                headSha = refData.object.sha;
+              } catch (err) {
+                console.log(`Issue #${issueNum}: failed to fetch HEAD SHA: ${err.message}. Skipping.`);
+                return;
+              }
+
+              const { completed, blocked, pending } = await computeSetResolution(cfg, setsToCheck, headSha);
+              console.log(`Issue #${issueNum}: head_sha=${headSha}, completed=${JSON.stringify(completed)}, blocked=${JSON.stringify(blocked)}, pending=${JSON.stringify(pending)}`);
+
+              if (blocked.length > 0) {
+                const failedWf = ((cfg.sets[blocked[0]] || {}).workflows || [])[0] || blocked[0];
+                await setDeploymentBlocked(issueNum, failedWf, 'failure');
+              } else if (pending.length === 0) {
+                await setDeploymentComplete(issueNum, `Deployment complete (healed by successful deploy on HEAD).`);
+              } else {
+                console.log(`Issue #${issueNum}: still waiting for sets: ${pending.join(', ')}`);
+              }
+            }
+
+            // ── Shared helper: global BLOCKED sweep ──
+            // Scans all DEPLOYING/BLOCKED issues (open + closed) and reconciles
+            // each one against the current HEAD SHA. Used by both workflow_run
+            // and repository_dispatch handlers after a successful deploy.
+            async function runGlobalBlockedSweep(excludeIssueNumbers) {
+              console.log('=== Running global BLOCKED sweep ===');
+              try {
+                const cfg = await loadLifecycleConfig();
+                const [openResp, closedResp] = await Promise.all([
+                  github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100, sort: 'updated', direction: 'desc' }),
+                  github.rest.issues.listForRepo({ owner, repo, state: 'closed', per_page: 100, sort: 'updated', direction: 'desc' })
+                ]);
+                const openBlocked = openResp.data.filter(i =>
+                  i.title.includes('[AGENT:DEPLOYING]') || i.title.includes('[DEPLOYMENT BLOCKED]')
+                );
+                const closedBlocked = closedResp.data.filter(i => i.title.includes('[DEPLOYMENT BLOCKED]'));
+                const openNums = new Set(openBlocked.map(i => i.number));
+                const allBlocked = [
+                  ...openBlocked.filter(i => !excludeIssueNumbers.has(i.number)),
+                  ...closedBlocked.filter(i => !openNums.has(i.number) && !excludeIssueNumbers.has(i.number))
+                ];
+                console.log(`Global BLOCKED sweep: ${allBlocked.length} issue(s) to check.`);
+                for (const issue of allBlocked) {
+                  try {
+                    await reconcileBlockedIssue(issue.number, cfg);
+                  } catch (e) {
+                    console.log(`Global sweep failed for issue #${issue.number}: ${e.message}`);
+                  }
+                }
+              } catch (e) {
+                console.log(`Global BLOCKED sweep failed: ${e.message}`);
+              }
+            }
+
+            // ── EVENT HANDLERS ────────────────────────────────────────────────
+
+            // ── 1. PR MERGED ──────────────────────────────────────────────────
+            if (eventName === 'pull_request' && prMerged && prNumber > 0) {
+              console.log(`=== PR MERGED (pr #${prNumber}) ===`);
+              let issueNumbers = [];
+              try {
+                issueNumbers = await getLinkedIssues(prNumber);
+              } catch (e) {
+                console.log(`Failed to fetch PR #${prNumber}: ${e.message}`);
+                return;
+              }
+              if (issueNumbers.length === 0) {
+                console.log('No linked issues in PR body. Exiting.');
+                return;
+              }
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              const mergeSha     = pr.merge_commit_sha || pr.head.sha;
+              const headSha      = pr.head.sha;
+              const requirements = await computeDeployRequirements(prNumber);
+
+              for (const issueNum of issueNumbers) {
+                try {
+                  if (requirements.items.length === 0) {
+                    await setDeploymentComplete(issueNum,
+                      `PR #${prNumber} merged. No deploy workflows required for the changed files.`);
+                  } else {
+                    await setDeploying(issueNum, prNumber, mergeSha, headSha, requirements);
+                  }
+                } catch (e) {
+                  console.log(`Failed issue #${issueNum}: ${e.message}`);
+                }
+              }
+              return;
+            }
+
+            // ── 2. PUSH BACKSTOP ──────────────────────────────────────────────
+            if (eventName === 'push' && pushSha) {
+              console.log(`=== PUSH BACKSTOP (sha: ${pushSha}) ===`);
+              const issueNumbers = new Set();
+              let   prNum        = null;
+              let   mergeSha     = pushSha;
+              let   headSha      = pushSha;
+
+              const addIssues = (body) =>
+                parseClosingKeywordIssues(body).forEach(n => issueNumbers.add(n));
+
+              try {
+                const resp = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner, repo, commit_sha: pushSha
+                });
+                for (const pr of resp.data) {
+                  if (pr.merged_at) {
+                    prNum    = pr.number;
+                    mergeSha = pr.merge_commit_sha || pushSha;
+                    headSha  = pr.head.sha;
+                    addIssues(pr.body);
+                  }
+                }
+              } catch (e) {
+                console.log(`SHA-based PR lookup failed: ${e.message}`);
+              }
+
+              if (issueNumbers.size === 0) {
+                try {
+                  const closed = await github.rest.pulls.list({
+                    owner, repo, state: 'closed', sort: 'updated', direction: 'desc', per_page: 20
+                  });
+                  for (const pr of closed.data) {
+                    if (pr.merge_commit_sha === pushSha || pr.head.sha === pushSha) {
+                      prNum    = pr.number;
+                      mergeSha = pr.merge_commit_sha || pushSha;
+                      headSha  = pr.head.sha;
+                      addIssues(pr.body);
+                      break;
+                    }
+                  }
+                } catch (e) {
+                  console.log(`Closed-PR scan failed: ${e.message}`);
+                }
+              }
+
+              if (issueNumbers.size === 0 || prNum === null) {
+                console.log('No linked issues or merged PR found for push. Exiting.');
+                return;
+              }
+
+              for (const issueNum of issueNumbers) {
+                try {
+                  const comments = await github.rest.issues.listComments({
+                    owner, repo, issue_number: issueNum, per_page: 50
+                  });
+                  const alreadyHandled = comments.data.some(c =>
+                    c.body.startsWith('DSG-LIFECYCLE:') &&
+                    (c.body.includes(`merge_sha: ${mergeSha}`) || c.body.includes(`head_sha: ${headSha}`))
+                  );
+                  if (alreadyHandled) {
+                    console.log(`Issue #${issueNum}: already handled by PR-merge path. Skipping.`);
+                    continue;
+                  }
+                  console.log(`Issue #${issueNum}: no metadata found; running push-backstop reconcile.`);
+                  const requirements = await computeDeployRequirements(prNum);
+                  if (requirements.items.length === 0) {
+                    await setDeploymentComplete(issueNum,
+                      `PR #${prNum} merged. No deploy workflows required for the changed files. (push-backstop)`);
+                  } else {
+                    await setDeploying(issueNum, prNum, mergeSha, headSha, requirements);
+                  }
+                } catch (e) {
+                  console.log(`Failed issue #${issueNum}: ${e.message}`);
+                }
+              }
+              return;
+            }
+
+            // ── 3. DEPLOY WORKFLOW COMPLETED ──────────────────────────────────
+            if (eventName === 'workflow_run') {
+              console.log(`=== WORKFLOW_RUN (${wfRunName} / ${wfRunConclusion} / sha: ${wfRunSha}) ===`);
+              const lifecycleControlWorkflows = ['Lifecycle Bootstrap', 'Issue Deploy Lifecycle'];
+              if (lifecycleControlWorkflows.includes(wfRunName)) {
+                console.log(`Ignoring lifecycle-control workflow "${wfRunName}" to prevent recursion. Exiting.`);
+                return;
+              }
+
+              const issueNumbers = new Set();
+              const addIssues    = (body) =>
+                parseClosingKeywordIssues(body).forEach(n => issueNumbers.add(n));
+
+              try {
+                const resp = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner, repo, commit_sha: wfRunSha
+                });
+                for (const pr of resp.data) addIssues(pr.body);
+              } catch (e) {
+                console.log(`SHA-based PR lookup failed: ${e.message}`);
+              }
+
+              if (issueNumbers.size === 0) {
+                try {
+                  const closed = await github.rest.pulls.list({
+                    owner, repo, state: 'closed', sort: 'updated', direction: 'desc', per_page: 20
+                  });
+                  for (const pr of closed.data) {
+                    if (pr.merge_commit_sha === wfRunSha || pr.head.sha === wfRunSha) {
+                      console.log(`Matched PR #${pr.number} via closed-PR SHA scan.`);
+                      addIssues(pr.body);
+                    }
+                  }
+                } catch (e) {
+                  console.log(`Closed-PR SHA scan failed: ${e.message}`);
+                }
+              }
+
+              if (issueNumbers.size === 0) {
+                console.log('No issues via SHA lookup. Trying lifecycle metadata fallback...');
+                try {
+                  const allIssues = await github.rest.issues.listForRepo({
+                    owner, repo, state: 'all', per_page: 50, sort: 'updated', direction: 'desc'
+                  });
+                  let checked = 0;
+                  for (const issue of allIssues.data) {
+                    if (checked >= 20) break;
+                    if (!issue.title.includes('[AGENT:DEPLOYING]') && !issue.title.includes('[DEPLOYMENT BLOCKED]')) continue;
+                    checked++;
+                    const comments = await github.rest.issues.listComments({
+                      owner, repo, issue_number: issue.number, per_page: 50
+                    });
+                    for (const c of comments.data) {
+                      if (c.body.startsWith('DSG-LIFECYCLE:') &&
+                          (c.body.includes(`merge_sha: ${wfRunSha}`) || c.body.includes(`head_sha: ${wfRunSha}`))) {
+                        issueNumbers.add(issue.number);
+                        break;
+                      }
+                    }
+                  }
+                } catch (e) {
+                  console.log(`Lifecycle metadata fallback failed: ${e.message}`);
+                }
+              }
+
+              // Process linked issues for this specific workflow run
+              if (issueNumbers.size > 0) {
+                for (const issueNum of issueNumbers) {
+                  try {
+                    const comments = await github.rest.issues.listComments({
+                      owner, repo, issue_number: issueNum, per_page: 50
+                    });
+
+                    let requiredSets      = null;
+                    let expectedWorkflows = null;
+                    for (const c of [...comments.data].reverse()) {
+                      if (c.body.startsWith('DSG-LIFECYCLE:') &&
+                          (c.body.includes(`merge_sha: ${wfRunSha}`) || c.body.includes(`head_sha: ${wfRunSha}`))) {
+                        const meta = parseMetadata(c.body);
+                        if (meta?.required_sets) {
+                          try { requiredSets = JSON.parse(meta.required_sets); } catch {}
+                        } else if (meta?.expected_workflows) {
+                          try { expectedWorkflows = JSON.parse(meta.expected_workflows); } catch {}
+                        }
+                        break;
+                      }
+                    }
+
+                    if (requiredSets !== null) {
+                      const cfg = await loadLifecycleConfig();
+                      if (!cfg) { console.log(`Issue #${issueNum}: no config; skipping.`); continue; }
+                      const workflowSets = findSetsForWorkflow(cfg, wfRunName);
+                      const relevantSets = workflowSets.filter(s => requiredSets.includes(s));
+                      if (relevantSets.length === 0) {
+                        console.log(`Issue #${issueNum}: "${wfRunName}" not in any required set ${JSON.stringify(requiredSets)}; ignoring.`);
+                        continue;
+                      }
+                      if (wfRunConclusion !== 'success') {
+                        await setDeploymentBlocked(issueNum, wfRunName, wfRunConclusion);
+                      } else {
+                        const { completed, blocked, pending } = await computeSetResolution(
+                          cfg, requiredSets, wfRunSha, [wfRunName]
+                        );
+                        console.log(`Issue #${issueNum}: completed=${JSON.stringify(completed)}, blocked=${JSON.stringify(blocked)}, pending=${JSON.stringify(pending)}`);
+                        if (blocked.length > 0) {
+                          await setDeploymentBlocked(issueNum, wfRunName, wfRunConclusion);
+                        } else if (pending.length === 0) {
+                          await setDeploymentComplete(issueNum, `Deployment complete (workflow: "${wfRunName}").`);
+                        } else {
+                          await github.rest.issues.createComment({
+                            owner, repo, issue_number: issueNum,
+                            body: `Workflow "${wfRunName}" succeeded. Waiting for remaining deployment sets: ${pending.join(', ')}`
+                          });
+                          console.log(`Issue #${issueNum}: waiting for sets: ${pending.join(', ')}`);
+                        }
+                      }
+                    } else {
+                      if (expectedWorkflows !== null && !expectedWorkflows.includes(wfRunName)) {
+                        console.log(`Issue #${issueNum}: ignoring "${wfRunName}" (not in expected set: ${JSON.stringify(expectedWorkflows)})`);
+                        continue;
+                      }
+                      if (wfRunConclusion === 'success') {
+                        let allSucceeded = true;
+                        if (expectedWorkflows && expectedWorkflows.length > 1) {
+                          const runsResp = await github.rest.actions.listWorkflowRunsForRepo({
+                            owner, repo, head_sha: wfRunSha, status: 'success', per_page: 100
+                          });
+                          const succeededNames = new Set(runsResp.data.workflow_runs.map(r => r.name));
+                          succeededNames.add(wfRunName);
+                          const pending = expectedWorkflows.filter(n => !succeededNames.has(n));
+                          if (pending.length > 0) {
+                            allSucceeded = false;
+                            await github.rest.issues.createComment({
+                              owner, repo, issue_number: issueNum,
+                              body: `Workflow "${wfRunName}" succeeded. Waiting for remaining deploy workflows before marking DEPLOYMENT COMPLETE: ${pending.join(', ')}`
+                            });
+                            console.log(`Issue #${issueNum}: waiting for: ${pending.join(', ')}`);
+                          }
+                        }
+                        if (allSucceeded) {
+                          await setDeploymentComplete(issueNum, `Deployment complete (workflow: "${wfRunName}").`);
+                        }
+                      } else {
+                        await setDeploymentBlocked(issueNum, wfRunName, wfRunConclusion);
+                      }
+                    }
+                  } catch (e) {
+                    console.log(`Failed issue #${issueNum}: ${e.message}`);
+                  }
+                }
+              } else {
+                console.log('No linked issues found for this workflow_run.');
+              }
+
+              // ── Global BLOCKED sweep (workflow_run path) ──
+              // When any deploy workflow succeeds, sweep all blocked issues
+              // against current HEAD SHA to heal them.
+              if (wfRunConclusion === 'success') {
+                await runGlobalBlockedSweep(issueNumbers);
+              }
+
+              return;
+            }
+
+            // ── 4. REPOSITORY_DISPATCH (explicit deploy-set signal) ──────────
+            if (eventName === 'repository_dispatch') {
+              console.log(`=== REPOSITORY_DISPATCH (set: ${dispatchSetId} / ${dispatchConclusion} / sha: ${dispatchSha}) ===`);
+              if (!dispatchSetId || !dispatchSha) {
+                console.log('Missing set_id or sha in dispatch payload. Exiting.');
+                return;
+              }
+
+              const issueNumbers = new Set(dispatchIssueNums.filter(n => typeof n === 'number' && n > 0));
+              const addIssues = (body) =>
+                parseClosingKeywordIssues(body).forEach(n => issueNumbers.add(n));
+
+              if (issueNumbers.size === 0) {
+                try {
+                  const resp = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                    owner, repo, commit_sha: dispatchSha
+                  });
+                  for (const pr of resp.data) addIssues(pr.body);
+                } catch (e) { console.log(`SHA lookup: ${e.message}`); }
+              }
+
+              if (issueNumbers.size === 0) {
+                try {
+                  const allIssues = await github.rest.issues.listForRepo({
+                    owner, repo, state: 'all', per_page: 50, sort: 'updated', direction: 'desc'
+                  });
+                  for (const issue of allIssues.data) {
+                    if (!issue.title.includes('[AGENT:DEPLOYING]') && !issue.title.includes('[DEPLOYMENT BLOCKED]')) continue;
+                    const comments = await github.rest.issues.listComments({
+                      owner, repo, issue_number: issue.number, per_page: 50
+                    });
+                    for (const c of comments.data) {
+                      if (c.body.startsWith('DSG-LIFECYCLE:') &&
+                          (c.body.includes(`merge_sha: ${dispatchSha}`) || c.body.includes(`head_sha: ${dispatchSha}`))) {
+                        issueNumbers.add(issue.number);
+                        break;
+                      }
+                    }
+                  }
+                } catch (e) { console.log(`Metadata fallback: ${e.message}`); }
+              }
+
+              for (const issueNum of issueNumbers) {
+                try {
+                  const comments = await github.rest.issues.listComments({
+                    owner, repo, issue_number: issueNum, per_page: 100
+                  });
+
+                  let requiredSets      = null;
+                  let expectedWorkflows = null;
+                  for (const c of [...comments.data].reverse()) {
+                    if (!c.body.startsWith('DSG-LIFECYCLE:')) continue;
+                    if (!c.body.includes(`merge_sha: ${dispatchSha}`) && !c.body.includes(`head_sha: ${dispatchSha}`)) continue;
+                    const meta = parseMetadata(c.body);
+                    if (meta?.required_sets) {
+                      try { requiredSets = JSON.parse(meta.required_sets); } catch {}
+                    } else if (meta?.expected_workflows) {
+                      try { expectedWorkflows = JSON.parse(meta.expected_workflows); } catch {}
+                    }
+                    break;
+                  }
+
+                  if (requiredSets !== null) {
+                    if (!requiredSets.includes(dispatchSetId)) {
+                      console.log(`Issue #${issueNum}: set "${dispatchSetId}" not in required_sets ${JSON.stringify(requiredSets)}; ignoring.`);
+                      continue;
+                    }
+                    if (dispatchConclusion !== 'success') {
+                      await setDeploymentBlocked(issueNum, dispatchSetId, dispatchConclusion);
+                      continue;
+                    }
+                    const signalBody = [
+                      'DSG-LIFECYCLE-SIGNAL:',
+                      `set_id: ${dispatchSetId}`,
+                      `sha: ${dispatchSha}`,
+                      `conclusion: success`,
+                      `timestamp: ${new Date().toISOString()}`
+                    ].join('\n');
+                    await github.rest.issues.createComment({ owner, repo, issue_number: issueNum, body: signalBody });
+                    const refreshed = await github.rest.issues.listComments({
+                      owner, repo, issue_number: issueNum, per_page: 100
+                    });
+                    const succeededSets = new Set();
+                    for (const c of refreshed.data) {
+                      if (!c.body.startsWith('DSG-LIFECYCLE-SIGNAL:')) continue;
+                      const lines = c.body.split('\n');
+                      const shaLine  = lines.find(l => l.startsWith('sha: '));
+                      const setLine  = lines.find(l => l.startsWith('set_id: '));
+                      const concLine = lines.find(l => l.startsWith('conclusion: '));
+                      if (shaLine && shaLine.slice(5).trim() === dispatchSha &&
+                          setLine && concLine && concLine.slice(12).trim() === 'success') {
+                        succeededSets.add(setLine.slice(8).trim());
+                      }
+                    }
+                    const pending = requiredSets.filter(s => !succeededSets.has(s));
+                    console.log(`Issue #${issueNum}: signaled=${JSON.stringify([...succeededSets])}, pending=${JSON.stringify(pending)}`);
+                    if (pending.length === 0) {
+                      await setDeploymentComplete(issueNum, `Deployment complete (set: "${dispatchSetId}").`);
+                    } else {
+                      await github.rest.issues.createComment({
+                        owner, repo, issue_number: issueNum,
+                        body: `Set "${dispatchSetId}" deployed successfully. Waiting for remaining sets: ${pending.join(', ')}`
+                      });
+                      console.log(`Issue #${issueNum}: waiting for sets: ${pending.join(', ')}`);
+                    }
+
+                  } else if (expectedWorkflows !== null) {
+                    let dispatchWorkflowName = dispatchSetId;
+                    try {
+                      const cfg = await loadLifecycleConfig();
+                      if (cfg && cfg.sets && cfg.sets[dispatchSetId]) {
+                        const wfs = (cfg.sets[dispatchSetId].workflows || []);
+                        if (wfs.length > 0) dispatchWorkflowName = wfs[0];
+                      }
+                    } catch (e) { /* non-fatal */ }
+                    const nameMatch = expectedWorkflows.includes(dispatchWorkflowName) || expectedWorkflows.includes(dispatchSetId);
+                    if (!nameMatch) {
+                      console.log(`Issue #${issueNum}: dispatch set "${dispatchSetId}" (workflow: "${dispatchWorkflowName}") not in expected_workflows ${JSON.stringify(expectedWorkflows)}; ignoring.`);
+                      continue;
+                    }
+                    if (dispatchConclusion !== 'success') {
+                      await setDeploymentBlocked(issueNum, dispatchWorkflowName, dispatchConclusion);
+                      continue;
+                    }
+                    const runsResp = await github.rest.actions.listWorkflowRunsForRepo({
+                      owner, repo, head_sha: dispatchSha, status: 'success', per_page: 100
+                    });
+                    const succeededNames = new Set(runsResp.data.workflow_runs.map(r => r.name));
+                    succeededNames.add(dispatchWorkflowName);
+                    succeededNames.add(dispatchSetId);
+                    const pendingWfs = expectedWorkflows.filter(n => !succeededNames.has(n));
+                    console.log(`Issue #${issueNum}: v1/v2 dispatch heal — expected=${JSON.stringify(expectedWorkflows)}, pending=${JSON.stringify(pendingWfs)}`);
+                    if (pendingWfs.length === 0) {
+                      await setDeploymentComplete(issueNum, `Deployment complete (set: "${dispatchSetId}").`);
+                    } else {
+                      await github.rest.issues.createComment({
+                        owner, repo, issue_number: issueNum,
+                        body: `Set "${dispatchSetId}" deployed successfully. Waiting for remaining workflows: ${pendingWfs.join(', ')}`
+                      });
+                      console.log(`Issue #${issueNum}: still waiting for: ${pendingWfs.join(', ')}`);
+                    }
+
+                  } else {
+                    console.log(`Issue #${issueNum}: no lifecycle metadata (required_sets or expected_workflows) for sha ${dispatchSha}; ignoring.`);
+                    continue;
+                  }
+                } catch (e) {
+                  console.log(`Failed issue #${issueNum}: ${e.message}`);
+                }
+              }
+
+              // ── Global BLOCKED sweep (repository_dispatch path) ──
+              if (dispatchConclusion === 'success') {
+                await runGlobalBlockedSweep(issueNumbers);
+              }
+
+              return;
+            }
+
+            // ── 5. WORKFLOW_DISPATCH (manual / self-healing full reconcile) ───
+            if (eventName === 'workflow_dispatch') {
+              console.log('=== WORKFLOW_DISPATCH: full reconcile of open NEEDS-REVIEW and DEPLOYING issues ===');
+              try {
+                const openIssues = await github.rest.issues.listForRepo({
+                  owner, repo, state: 'open', per_page: 100, sort: 'updated', direction: 'desc'
+                });
+
+                const needsReview = openIssues.data.filter(i => i.title.includes('[AGENT:NEEDS-REVIEW]'));
+                console.log(`Found ${needsReview.length} issue(s) in NEEDS-REVIEW state.`);
+
+                for (const issue of needsReview) {
+                  const issueNum = issue.number;
+                  try {
+                    const closedPRs = await github.rest.pulls.list({
+                      owner, repo, state: 'closed', sort: 'updated', direction: 'desc', per_page: 50
+                    });
+                    let linkedPR = null;
+                    for (const pr of closedPRs.data) {
+                      if (!pr.merged_at) continue;
+                      const bodyRefs = parseClosingKeywordIssues(pr.body || '');
+                      if (bodyRefs.includes(issueNum)) {
+                        linkedPR = pr;
+                        break;
+                      }
+                    }
+                    if (!linkedPR) {
+                      console.log(`Issue #${issueNum}: no merged PR found. Skipping.`);
+                      continue;
+                    }
+                    const prNum    = linkedPR.number;
+                    const mergeSha = linkedPR.merge_commit_sha || linkedPR.head.sha;
+                    const headSha  = linkedPR.head.sha;
+
+                    const comments = await github.rest.issues.listComments({
+                      owner, repo, issue_number: issueNum, per_page: 50
+                    });
+                    const alreadyHandled = comments.data.some(c =>
+                      c.body.startsWith('DSG-LIFECYCLE:') &&
+                      (c.body.includes(`merge_sha: ${mergeSha}`) || c.body.includes(`head_sha: ${headSha}`))
+                    );
+                    if (alreadyHandled) {
+                      console.log(`Issue #${issueNum}: metadata already present for PR #${prNum}. Skipping.`);
+                      continue;
+                    }
+
+                    const requirements = await computeDeployRequirements(prNum);
+                    console.log(`Issue #${issueNum}: reconciling (PR #${prNum}, requirements: ${JSON.stringify(requirements)})`);
+                    if (requirements.items.length === 0) {
+                      await setDeploymentComplete(issueNum,
+                        `PR #${prNum} merged. No deploy workflows required. (manual reconcile)`);
+                    } else if (requirements.isV3) {
+                      const cfg = await loadLifecycleConfig();
+                      const { completed, blocked, pending } = await computeSetResolution(cfg, requirements.items, mergeSha);
+                      if (blocked.length > 0) {
+                        const failedWf = ((cfg.sets[blocked[0]] || {}).workflows || [])[0] || blocked[0];
+                        await setDeploymentBlocked(issueNum, failedWf, 'failure');
+                      } else if (pending.length === 0) {
+                        await setDeploymentComplete(issueNum, `All deployment sets satisfied (manual reconcile).`);
+                      } else {
+                        await setDeploying(issueNum, prNum, mergeSha, headSha, requirements);
+                      }
+                    } else {
+                      const runsResp = await github.rest.actions.listWorkflowRunsForRepo({
+                        owner, repo, head_sha: headSha, status: 'success', per_page: 100
+                      });
+                      const succeeded  = new Set(runsResp.data.workflow_runs.map(r => r.name));
+                      const pending    = requirements.items.filter(n => !succeeded.has(n));
+                      const allDone    = pending.length === 0;
+                      const failedResp = await github.rest.actions.listWorkflowRunsForRepo({
+                        owner, repo, head_sha: headSha, status: 'failure', per_page: 100
+                      });
+                      const failedNames = failedResp.data.workflow_runs.map(r => r.name);
+                      const anyFailed   = requirements.items.some(n => failedNames.includes(n));
+                      if (anyFailed) {
+                        await setDeploymentBlocked(issueNum, failedNames.find(n => requirements.items.includes(n)), 'failure');
+                      } else if (allDone) {
+                        await setDeploymentComplete(issueNum, `All deploy workflows succeeded (manual reconcile).`);
+                      } else {
+                        await setDeploying(issueNum, prNum, mergeSha, headSha, requirements);
+                      }
+                    }
+                  } catch (e) {
+                    console.log(`Failed reconciling issue #${issueNum}: ${e.message}`);
+                  }
+                }
+
+                // ── DEPLOYING / BLOCKED reconcile ─────────────────────────
+                let closedBlocked = [];
+                try {
+                  const closedResp = await github.rest.issues.listForRepo({
+                    owner, repo, state: 'closed', per_page: 100, sort: 'updated', direction: 'desc'
+                  });
+                  closedBlocked = closedResp.data.filter(i => i.title.includes('[DEPLOYMENT BLOCKED]'));
+                  console.log(`Found ${closedBlocked.length} closed issue(s) with [DEPLOYMENT BLOCKED] title.`);
+                } catch (e) {
+                  console.log(`Closed BLOCKED issue fetch failed: ${e instanceof Error ? e.message : String(e)}`);
+                }
+
+                const openDeploying = openIssues.data.filter(i =>
+                  i.title.includes('[AGENT:DEPLOYING]') || i.title.includes('[DEPLOYMENT BLOCKED]')
+                );
+                const openNums = new Set(openDeploying.map(i => i.number));
+                const deploying = [
+                  ...openDeploying,
+                  ...closedBlocked.filter(i => !openNums.has(i.number))
+                ];
+                console.log(`Found ${deploying.length} issue(s) in DEPLOYING/BLOCKED state (open + closed).`);
+
+                const cfg = await loadLifecycleConfig().catch(() => null);
+                for (const issue of deploying) {
+                  try {
+                    await reconcileBlockedIssue(issue.number, cfg);
+                  } catch (e) {
+                    console.log(`Failed reconciling DEPLOYING issue #${issue.number}: ${e.message}`);
+                  }
+                }
+              } catch (e) {
+                console.log(`Full reconcile failed: ${e.message}`);
+              }
+              return;
+            }
+
+            console.log(`Unhandled event_name "${eventName}". Exiting.`);
