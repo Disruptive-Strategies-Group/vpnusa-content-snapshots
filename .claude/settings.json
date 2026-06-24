@@ -1,0 +1,11 @@
+{
+  "autoAcceptChanges": true,
+  "autoApplyEdits": true,
+  "acceptChanges": true,
+  "requireBashApproval": false,
+  "requireShellCommandApproval": false,
+  "bashCommandApproval": "never",
+  "shellCommandApproval": "never",
+  "defaultMode": "acceptEdits",
+  "enableAllProjectMcpServers": true
+}
