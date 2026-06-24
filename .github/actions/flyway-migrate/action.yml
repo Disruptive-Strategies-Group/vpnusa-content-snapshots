@@ -1,0 +1,126 @@
+name: Flyway Migrate
+description: Open SSM port-forward tunnel to RDS via bastion and run flyway migrate against flyway/sql/.
+
+inputs:
+  bastion-instance-id:
+    description: EC2 instance ID of the SSM bastion host that fronts RDS.
+    required: true
+  db-host:
+    description: RDS endpoint hostname (target of the SSM port-forward).
+    required: true
+  db-port:
+    description: RDS port.
+    required: false
+    default: "5432"
+  db-name:
+    description: Database name to migrate.
+    required: true
+  db-user:
+    description: Database user.
+    required: true
+  db-password:
+    description: Database password.
+    required: true
+  aws-region:
+    description: AWS region for the SSM session.
+    required: false
+    default: "us-east-2"
+  flyway-version:
+    description: Pinned Flyway CLI version to download from S3.
+    required: false
+    default: "10.22.0"
+  flyway-tarball-bucket:
+    description: S3 bucket hosting the Flyway CLI tarball.
+    required: false
+    default: "devops-dashboard-dev-config"
+  flyway-tarball-key:
+    description: S3 object key for the Flyway CLI tarball.
+    required: false
+    default: "flyway/flyway-commandline-10.22.0-linux-x64.tar.gz"
+  flyway-tarball-sha256:
+    description: Expected SHA-256 checksum of the Flyway CLI tarball.
+    required: false
+    default: "b37dc81463f494904228083d8067a6fc8140202220625f54a57398f7a176a49f"
+
+runs:
+  using: composite
+  steps:
+    - name: Install AWS Session Manager plugin
+      shell: bash
+      run: |
+        set -euo pipefail
+        curl -fsSL --retry 3 --retry-delay 5 \
+          "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" \
+          -o /tmp/session-manager-plugin.deb
+        sudo dpkg -i /tmp/session-manager-plugin.deb
+
+    - name: Install Flyway CLI from S3
+      shell: bash
+      run: |
+        set -euo pipefail
+        FLYWAY_VERSION="${{ inputs.flyway-version }}"
+        S3_BUCKET="${{ inputs.flyway-tarball-bucket }}"
+        S3_KEY="${{ inputs.flyway-tarball-key }}"
+        EXPECTED_SHA256="${{ inputs.flyway-tarball-sha256 }}"
+
+        # Download tarball from self-hosted S3 bucket (IAM-authenticated)
+        aws s3 cp "s3://${S3_BUCKET}/${S3_KEY}" /tmp/flyway.tar.gz
+
+        # Verify SHA-256 checksum
+        COMPUTED_SHA256=$(sha256sum /tmp/flyway.tar.gz | cut -d' ' -f1)
+        if [ "$COMPUTED_SHA256" != "$EXPECTED_SHA256" ]; then
+          echo "ERROR: SHA-256 checksum mismatch for Flyway CLI tarball"
+          echo "  Expected: $EXPECTED_SHA256"
+          echo "  Computed: $COMPUTED_SHA256"
+          exit 1
+        fi
+        echo "SHA-256 checksum verified successfully"
+
+        tar -xzf /tmp/flyway.tar.gz -C /tmp
+        echo "/tmp/flyway-${FLYWAY_VERSION}" >> "$GITHUB_PATH"
+
+    - name: Start SSM port-forward tunnel
+      shell: bash
+      run: |
+        set -euo pipefail
+        LOCAL_PORT=15432
+        aws ssm start-session \
+          --region "${{ inputs.aws-region }}" \
+          --target "${{ inputs.bastion-instance-id }}" \
+          --document-name AWS-StartPortForwardingSessionToRemoteHost \
+          --parameters "host=${{ inputs.db-host }},portNumber=${{ inputs.db-port }},localPortNumber=${LOCAL_PORT}" &
+        echo "SSM_TUNNEL_PID=$!" >> "$GITHUB_ENV"
+        echo "FLYWAY_LOCAL_PORT=${LOCAL_PORT}" >> "$GITHUB_ENV"
+        python3 - <<'PYEOF'
+        import socket, time, sys
+        port = 15432
+        for i in range(30):
+            try:
+                with socket.create_connection(("127.0.0.1", port), timeout=1):
+                    print(f"Tunnel ready on port {port}")
+                    sys.exit(0)
+            except OSError:
+                time.sleep(1)
+        print("ERROR: tunnel did not become ready within 30 seconds", file=sys.stderr)
+        sys.exit(1)
+        PYEOF
+
+    - name: Run Flyway migrate
+      shell: bash
+      env:
+        FLYWAY_URL: "jdbc:postgresql://127.0.0.1:${{ env.FLYWAY_LOCAL_PORT }}/${{ inputs.db-name }}"
+        FLYWAY_USER: "${{ inputs.db-user }}"
+        FLYWAY_PASSWORD: "${{ inputs.db-password }}"
+      run: |
+        set -euo pipefail
+        flyway migrate \
+          -locations="filesystem:flyway/sql" \
+          -configFiles=flyway/flyway.conf
+
+    - name: Tear down SSM tunnel
+      if: always()
+      shell: bash
+      run: |
+        if [ -n "${SSM_TUNNEL_PID:-}" ]; then
+          kill "${SSM_TUNNEL_PID}" || true
+        fi
