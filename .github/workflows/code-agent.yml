@@ -1,0 +1,702 @@
+name: Claude Agent (plan gate + branch reuse + PR update)
+
+on:
+  issues:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  workflow_dispatch: {}
+
+concurrency:
+  group: claude-agent-${{ github.event.issue.number || github.event.issue.id || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  route:
+    name: route
+    if: >-
+      (
+        github.event_name == 'issues' &&
+        github.event.issue.state == 'open' &&
+        github.event.action == 'labeled' &&
+        contains(join(github.event.issue.labels.*.name, ','), 'agent:ready') &&
+        contains(fromJSON('["dsgowenjward","dsg-mcp-server[bot]"]'), github.event.issue.user.login) &&
+        !contains(join(github.event.issue.labels.*.name, ','), 'agent:do-not-run')
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.state == 'open' &&
+        contains(fromJSON('["dsgowenjward","dsg-mcp-server[bot]"]'), github.event.issue.user.login) &&
+        github.event.comment.user.login != github.repository_owner &&
+        (
+          github.event.comment.user.login == 'dsg-agentic-assistant[bot]' ||
+          github.event.comment.user.login == 'dsg-mcp-server[bot]' ||
+          !endsWith(github.event.comment.user.login, '[bot]')
+        ) &&
+        github.event.issue.pull_request == null &&
+        !contains(join(github.event.issue.labels.*.name, ','), 'agent:do-not-run') &&
+        (
+          startsWith(github.event.comment.body, '/agent revise') ||
+          startsWith(github.event.comment.body, '/agent approve')
+        )
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      issue_number: ${{ steps.meta.outputs.issue_number }}
+      issue_title: ${{ steps.meta.outputs.issue_title }}
+      branch_name: ${{ steps.meta.outputs.branch_name }}
+
+    steps:
+      - name: Validate actor is allowed
+        run: |
+          ACTOR="${{ github.actor }}"
+          ALLOWED_BOTS=(
+            "dsg-agentic-assistant[bot]"
+            "dsg-mcp-server[bot]"
+          )
+
+          echo "Workflow triggered by: $ACTOR"
+
+          IS_ALLOWED=false
+
+          # Allow all humans
+          if [[ "$ACTOR" != *"[bot]"* ]]; then
+            IS_ALLOWED=true
+          fi
+
+          # Allow canonical bot
+          for BOT in "${ALLOWED_BOTS[@]}"; do
+            if [[ "$ACTOR" == "$BOT" ]]; then
+              IS_ALLOWED=true
+            fi
+          done
+
+          if [ "$IS_ALLOWED" = false ]; then
+            echo "Workflow initiated by non-human actor: $ACTOR (blocked)"
+            exit 1
+          fi
+
+          echo "Actor allowed: $ACTOR"
+
+      - name: Capture metadata
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          issue_number="$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")"
+          issue_title="$(jq -r '.issue.title' "$GITHUB_EVENT_PATH")"
+          echo "issue_number=${issue_number}" >> "$GITHUB_OUTPUT"
+          echo "issue_title<<EOF" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "${issue_title}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "branch_name=claude/issue-${issue_number}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine agent mode
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Safely read comment body from the GitHub event payload.
+          body="$(jq -r '.comment.body // .issue.body // ""' "$GITHUB_EVENT_PATH")"
+
+          if [ "${{ github.event_name }}" = "issues" ]; then
+            echo "mode=plan" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$body" == /agent\ revise* ]]; then
+            echo "mode=revise-plan" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$body" == /agent\ approve* ]]; then
+            echo "mode=implement" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "mode=ignore" >> "$GITHUB_OUTPUT"
+
+  implement:
+    name: implement
+    needs: [route]
+    if: needs.route.outputs.mode == 'implement'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      no_changes: ${{ steps.push.outputs.no_changes }}
+      pre_push_branch_sha: ${{ steps.pre_push_sha.outputs.pre_push_branch_sha }}
+      post_push_branch_sha: ${{ steps.post_push_sha.outputs.post_push_branch_sha }}
+      branch_advanced: ${{ steps.branch_advanced.outputs.branch_advanced }}
+      pr_url: ${{ steps.pr.outputs.pr_url }}
+    env:
+      GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+      DEFAULT_BRANCH: main
+      ISSUE_NUMBER: ${{ needs.route.outputs.issue_number }}
+      ISSUE_TITLE: ${{ needs.route.outputs.issue_title }}
+      BRANCH_NAME: ${{ needs.route.outputs.branch_name }}
+
+    steps:
+      - name: Preflight secrets
+        shell: bash
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DSG_BOT_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          test -n "${DEEPSEEK_API_KEY}" || (echo "ERROR: DEEPSEEK_API_KEY missing/empty" && exit 1)
+          test -n "${DSG_BOT_TOKEN}" || (echo "ERROR: DSG_BOT_TOKEN missing/empty" && exit 1)
+
+      - name: Set IN-PROGRESS title
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = Number(process.env.ISSUE_NUMBER);
+            const currentTitle = context.payload.issue?.title || '';
+            if (!issue_number) return;
+
+            const YELLOW = String.fromCodePoint(0x1F7E1);
+            const BLUE = String.fromCodePoint(0x1F535);
+            const GREEN = String.fromCodePoint(0x1F7E2);
+            const RED = String.fromCodePoint(0x1F534);
+            const TOKEN_PAT = new RegExp(
+              '^[' + YELLOW + BLUE + GREEN + RED + ']?\\s*' +
+              '\\[AGENT:(PLAN-REVIEW|IN-PROGRESS|NEEDS-REVIEW|BLOCKED|DONE)\\]\\s*',
+              'iu'
+            );
+            const stripAllPrefixes = (t) => {
+              let s = t || '';
+              while (TOKEN_PAT.test(s)) { s = s.replace(TOKEN_PAT, ''); }
+              return s.trim();
+            };
+            const newTitle = BLUE + ' [AGENT:IN-PROGRESS] ' + stripAllPrefixes(currentTitle);
+            await github.rest.issues.update({ owner, repo, issue_number, title: newTitle });
+
+      - name: Checkout (bot token, full history)
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.DSG_BOT_TOKEN }}
+          fetch-depth: 0
+
+      - name: Prepare reusable branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name  "dsg-bot"
+          git config user.email "dsg-bot@users.noreply.github.com"
+          git fetch origin "${DEFAULT_BRANCH}" --depth=1
+          git checkout -B "${DEFAULT_BRANCH}" "origin/${DEFAULT_BRANCH}"
+          git reset --hard "origin/${DEFAULT_BRANCH}"
+          git clean -fd
+          if git ls-remote --exit-code --heads origin "${BRANCH_NAME}" >/dev/null 2>&1; then
+            git fetch origin "${BRANCH_NAME}" --depth=1
+            git checkout -B "${BRANCH_NAME}" "origin/${BRANCH_NAME}"
+            echo "Using existing remote issue branch without rebasing onto ${DEFAULT_BRANCH}."
+          elif git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
+            git checkout "${BRANCH_NAME}"
+            echo "Using existing local issue branch without rebasing onto ${DEFAULT_BRANCH}."
+          else
+            git checkout -b "${BRANCH_NAME}"
+            echo "Created new issue branch from ${DEFAULT_BRANCH}."
+          fi
+
+      - name: Capture remote issue branch SHA before implementation
+        id: pre_push_sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          pre_push_branch_sha="$(git ls-remote --heads origin "${BRANCH_NAME}" | awk '{print $1}' || true)"
+          echo "pre_push_branch_sha=${pre_push_branch_sha}" >> "$GITHUB_OUTPUT"
+          if [ -n "${pre_push_branch_sha}" ]; then
+            echo "Remote branch ${BRANCH_NAME} starts at ${pre_push_branch_sha}."
+          else
+            echo "Remote branch ${BRANCH_NAME} does not exist yet."
+          fi
+
+      - name: Gather issue context
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agent
+          gh issue view "${ISSUE_NUMBER}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json title,body,comments \
+            > .agent/issue-context.json
+
+      - name: Agent implements approved plan (edit → commit only)
+        id: claude
+        uses: ./.github/actions/coding-agent
+        with:
+          api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          issue-context: .agent/issue-context.json
+          branch-name: ${{ env.BRANCH_NAME }}
+          issue-number: ${{ env.ISSUE_NUMBER }}
+          issue-title: ${{ env.ISSUE_TITLE }}
+          max-turns: "80"
+
+      - name: Safety net - commit working tree if Claude didn't
+        id: autocommit
+        if: always() && !cancelled()
+        shell: bash
+        env:
+          CLAUDE_OUTCOME: ${{ steps.claude.outcome }}
+        run: |
+          set -euo pipefail
+          git checkout "${BRANCH_NAME}"
+
+          # Never allow the agent to modify control files (these changes cause failures / unwanted drift).
+          git restore --staged --worktree .claude/settings.json 2>/dev/null || true
+          git restore --staged --worktree .github/workflows 2>/dev/null || true
+          rm -rf .agent
+
+          # Clean up junk files from shell redirect interpretation of version specifiers
+          # e.g., "pip install pkg>=1.0" creates a file named "=1.0" via the ">" redirect
+          find . -maxdepth 1 -name '=[0-9]*' -type f -delete 2>/dev/null || true
+          find . -maxdepth 1 -name '[0-9]*.[0-9]*' -type f -size -1k -newer .git/HEAD -delete 2>/dev/null || true
+
+          # If Claude created files but didn't commit, create a commit so push/PR can happen.
+          if [ -n "$(git status --porcelain)" ]; then
+            if [ "${CLAUDE_OUTCOME}" = "success" ]; then
+              commit_msg="Agent: implement #${ISSUE_NUMBER}"
+            else
+              commit_msg="WIP: partial work (turn limit) - agent: implement #${ISSUE_NUMBER}"
+            fi
+            echo "Working tree changes detected; creating safety-net commit (${commit_msg})."
+            git add -A
+            git commit -m "${commit_msg}" || true
+          else
+            echo "No working tree changes; nothing to commit."
+          fi
+
+      - name: Auto-format Terraform files (if terraform/ exists)
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout "${BRANCH_NAME}"
+
+          if [ ! -d "terraform" ]; then
+            echo "No terraform/ directory found; skipping terraform fmt."
+            exit 0
+          fi
+
+          if ! command -v terraform &>/dev/null; then
+            echo "Installing terraform..."
+            curl -fsSL https://releases.hashicorp.com/terraform/1.7.5/terraform_1.7.5_linux_amd64.zip -o /tmp/terraform.zip
+            unzip -o /tmp/terraform.zip -d /usr/local/bin terraform
+            chmod +x /usr/local/bin/terraform
+          fi
+
+          terraform fmt -recursive -write=true terraform/
+
+          if [ -n "$(git status --porcelain)" ]; then
+            git add -A
+            git commit -m "chore: terraform fmt"
+            echo "Committed terraform fmt fixes."
+          else
+            echo "No terraform fmt changes needed."
+          fi
+
+      - name: Sync canonical workflows from main (if not intentionally modified)
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout "${BRANCH_NAME}"
+
+          mkdir -p .github/workflows
+          merge_base=$(git merge-base HEAD "origin/${DEFAULT_BRANCH}" 2>/dev/null || git rev-parse "origin/${DEFAULT_BRANCH}")
+          changed=0
+
+          for f in ci.yml code-agent.yml issue-deploy-lifecycle.yml lifecycle-bootstrap.yml agent-pr-ci-summary.yml \
+                    agent-merge.yml agent-pr-claude-verdict.yml agent-pr-review.yml agent-pr-revise.yml; do
+            fp=".github/workflows/${f}"
+            # Only sync if branch hasn't intentionally modified this file vs merge-base
+            if git diff --quiet "${merge_base}" HEAD -- "${fp}" 2>/dev/null; then
+              if git show "origin/${DEFAULT_BRANCH}:${fp}" > "${fp}.main" 2>/dev/null; then
+                if ! diff -q "${fp}" "${fp}.main" >/dev/null 2>&1; then
+                  mv "${fp}.main" "${fp}"
+                  git add "${fp}"
+                  changed=1
+                  echo "Synced ${fp} from ${DEFAULT_BRANCH}."
+                else
+                  rm "${fp}.main"
+                fi
+              fi
+            else
+              echo "Branch intentionally modified ${fp}; skipping sync."
+              rm -f "${fp}.main"
+            fi
+          done
+
+          if [ "${changed}" -eq 1 ]; then
+            git commit -m "chore: sync canonical workflows from ${DEFAULT_BRANCH}"
+          fi
+
+      - name: Sanitize CI-skip markers from agent branch commits
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout "${BRANCH_NAME}"
+
+          # Enumerate commits in agent branch range (oldest to newest)
+          readarray -t commits < <(git log --reverse --format='%H' "origin/${DEFAULT_BRANCH}..HEAD" 2>/dev/null || true)
+
+          if [ ${#commits[@]} -eq 0 ]; then
+            echo "No commits found in branch range; nothing to sanitize."
+            exit 0
+          fi
+
+          echo "Checking ${#commits[@]} commit(s) for CI-skip markers..."
+
+          # Forbidden markers (case-insensitive): [skip ci], [ci skip], [no ci], [skip actions], skip-checks: true
+          SKIP_GREP='\[(skip[[:space:]]+ci|ci[[:space:]]+skip|no[[:space:]]+ci|skip[[:space:]]+actions)\]|skip-checks:[[:space:]]*true'
+
+          # Check if any commits need sanitization
+          needs_sanitization=0
+          for commit in "${commits[@]}"; do
+            msg=$(git log -1 --format='%B' "${commit}")
+            if echo "${msg}" | grep -iqE "${SKIP_GREP}"; then
+              needs_sanitization=1
+              echo "  Marker found in ${commit:0:8}"
+            fi
+          done
+
+          if [ ${needs_sanitization} -eq 0 ]; then
+            echo "No CI-skip markers found; nothing to sanitize."
+          else
+            echo "Sanitizing commit messages (branch-scoped only)..."
+
+            # Save current branch name
+            original_branch="${BRANCH_NAME}"
+
+            # Create a new branch from the base
+            temp_branch="temp-sanitize-$$-$(date +%s)-${RANDOM}"
+            git checkout -b "${temp_branch}" "origin/${DEFAULT_BRANCH}"
+
+            # Cherry-pick each commit, sanitizing messages as needed
+            for commit in "${commits[@]}"; do
+              # Get original commit message BEFORE cherry-pick
+              original_msg=$(git show -s --format='%B' "${commit}")
+
+              if ! git cherry-pick "${commit}" --no-commit 2>/dev/null; then
+                echo "BLOCKER: Cherry-pick failed for commit ${commit:0:8}"
+                git cherry-pick --abort 2>/dev/null || true
+                exit 1
+              fi
+
+              # Sanitize the message
+              sanitized_msg=$(echo "${original_msg}" | perl -pe 's/\[(skip\s+ci|ci\s+skip|no\s+ci|skip\s+actions)\]//gi; s/skip-checks:\s*true//gi; s/  +/ /g; s/^\s+//; s/\s+$//')
+
+              # Ensure message is not empty after sanitization
+              if [ -z "${sanitized_msg}" ]; then
+                sanitized_msg="chore: sanitized commit (original message contained only CI-skip markers)"
+              fi
+
+              # Commit with sanitized message
+              if ! git commit --allow-empty -m "${sanitized_msg}"; then
+                echo "BLOCKER: Failed to commit sanitized message for ${commit:0:8}"
+                exit 1
+              fi
+            done
+
+            # Replace original branch with sanitized version
+            git branch -f "${original_branch}" HEAD
+            git checkout "${original_branch}"
+            git branch -D "${temp_branch}"
+
+            echo "Sanitization complete."
+          fi
+
+      - name: Verify no CI-skip markers remain
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout "${BRANCH_NAME}"
+
+          # Hard verification: fail if ANY forbidden marker still exists
+          SKIP_GREP='\[(skip[[:space:]]+ci|ci[[:space:]]+skip|no[[:space:]]+ci|skip[[:space:]]+actions)\]|skip-checks:[[:space:]]*true'
+
+          verification_failed=0
+          offending_commits=()
+          while IFS= read -r commit_hash; do
+            commit_msg=$(git log -1 --format='%B' "${commit_hash}")
+            if echo "${commit_msg}" | grep -iqE "${SKIP_GREP}"; then
+              verification_failed=1
+              offending_commits+=("${commit_hash}")
+            fi
+          done < <(git log --format='%H' "origin/${DEFAULT_BRANCH}..HEAD" 2>/dev/null || true)
+
+          if [ ${verification_failed} -eq 1 ]; then
+            echo "VERIFICATION FAILED: Forbidden CI-skip markers still detected after sanitization!"
+            echo ""
+            echo "Commits with remaining markers:"
+            for commit_hash in "${offending_commits[@]}"; do
+              echo "  - ${commit_hash:0:8}: $(git log -1 --format='%s' "${commit_hash}")"
+            done
+            echo ""
+            echo "BLOCKER: Cannot proceed with push. Sanitization failed."
+            exit 1
+          fi
+
+          echo "Verification passed: No forbidden CI-skip markers in commit history."
+
+      - name: Push branch (if changes exist)
+        id: push
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout "${BRANCH_NAME}"
+
+          if git diff --quiet "origin/${DEFAULT_BRANCH}...HEAD"; then
+            echo "no_changes=true" >> "$GITHUB_OUTPUT"
+            echo "No changes detected vs ${DEFAULT_BRANCH}; skipping push."
+            exit 0
+          fi
+
+          echo "no_changes=false" >> "$GITHUB_OUTPUT"
+          git push -u origin "${BRANCH_NAME}" --force-with-lease
+
+      - name: Capture remote issue branch SHA after push
+        id: post_push_sha
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.push.outputs.no_changes }}" = "true" ]; then
+            echo "post_push_branch_sha=" >> "$GITHUB_OUTPUT"
+            echo "No push occurred; post-push SHA left empty."
+            exit 0
+          fi
+
+          post_push_branch_sha="$(git ls-remote --heads origin "${BRANCH_NAME}" | awk '{print $1}' || true)"
+          echo "post_push_branch_sha=${post_push_branch_sha}" >> "$GITHUB_OUTPUT"
+          echo "Remote branch ${BRANCH_NAME} ends at ${post_push_branch_sha}."
+
+      - name: Compute whether issue branch advanced
+        id: branch_advanced
+        if: always() && !cancelled()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.pre_push_sha.outputs.pre_push_branch_sha }}" != "${{ steps.post_push_sha.outputs.post_push_branch_sha }}" ] && [ -n "${{ steps.post_push_sha.outputs.post_push_branch_sha }}" ]; then
+            echo "branch_advanced=true" >> "$GITHUB_OUTPUT"
+            echo "Issue branch advanced in this run."
+          else
+            echo "branch_advanced=false" >> "$GITHUB_OUTPUT"
+            echo "Issue branch did not advance in this run."
+          fi
+
+      - name: Resolve existing PR (do not create yet)
+        if: steps.branch_advanced.outputs.branch_advanced == 'true'
+        id: pr
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr_url=$(gh pr view --repo "${GITHUB_REPOSITORY}" --head "${BRANCH_NAME}" --json url -q .url 2>/dev/null || true)
+          echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
+          if [ -n "${pr_url}" ]; then
+            echo "Existing PR hint from implement job: ${pr_url}"
+          else
+            echo "No PR hint found for ${BRANCH_NAME}; finalize must re-resolve authoritatively before create/edit."
+          fi
+
+  finalize:
+    name: finalize
+    needs: [route, implement]
+    if: >-
+      always() &&
+      needs.route.result != 'skipped' &&
+      needs.route.outputs.mode != 'ignore' &&
+      !contains(join(github.event.issue.labels.*.name, ','), 'agent:do-not-run')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MODE: ${{ needs.route.outputs.mode }}
+      ISSUE_NUMBER: ${{ needs.route.outputs.issue_number }}
+      IMPLEMENT_RESULT: ${{ needs.implement.result }}
+      DEFAULT_BRANCH: main
+      BRANCH_NAME: ${{ needs.route.outputs.branch_name }}
+      PR_URL: ${{ needs.implement.outputs.pr_url }}
+      NO_CHANGES: ${{ needs.implement.outputs.no_changes }}
+      PRE_PUSH_BRANCH_SHA: ${{ needs.implement.outputs.pre_push_branch_sha }}
+      POST_PUSH_BRANCH_SHA: ${{ needs.implement.outputs.post_push_branch_sha }}
+      BRANCH_ADVANCED: ${{ needs.implement.outputs.branch_advanced }}
+
+    steps:
+      - name: Check for existing BLOCKED comment
+        id: check_blocked
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json comments --jq '[.comments[].body | select(startswith("<!-- AGENT_BLOCKED -->"))] | length')
+          echo "count=$EXISTING" >> "$GITHUB_OUTPUT"
+
+      - name: "Finalize: update title prefix + comment"
+        if: steps.check_blocked.outputs.count == '0'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.payload.issue?.number;
+            const currentTitle = context.payload.issue?.title || '';
+            if (!issue_number) return;
+
+            const YELLOW = String.fromCodePoint(0x1F7E1);
+            const BLUE  = String.fromCodePoint(0x1F535);
+            const GREEN = String.fromCodePoint(0x1F7E2);
+            const RED   = String.fromCodePoint(0x1F534);
+            const TOKEN_PAT = new RegExp(
+              '^[' + YELLOW + BLUE + GREEN + RED + ']?\\s*' +
+              '\\[AGENT:(PLAN-REVIEW|IN-PROGRESS|NEEDS-REVIEW|BLOCKED|DONE)\\]\\s*',
+              'iu'
+            );
+            const stripAllPrefixes = (t) => {
+              let s = t || '';
+              while (TOKEN_PAT.test(s)) { s = s.replace(TOKEN_PAT, ''); }
+              return s.trim();
+            };
+
+            const implementResult = process.env.IMPLEMENT_RESULT || '';
+            const noChanges = (process.env.NO_CHANGES || "") === "true";
+            const mode = process.env.MODE || '';
+            const prUrl = process.env.PR_URL || '';
+            const prePushBranchSha = process.env.PRE_PUSH_BRANCH_SHA || '';
+            const postPushBranchSha = process.env.POST_PUSH_BRANCH_SHA || '';
+            const branchAdvanced = (process.env.BRANCH_ADVANCED || "") === "true";
+
+            if (mode === 'plan' || mode === 'revise-plan') {
+              // Plan generation is now handled by the Lambda (processPlanGeneration).
+              // The runner no longer runs a plan job — this branch should not be reached
+              // in normal operation. If it is, do nothing and let the Lambda handle it.
+              return;
+            }
+
+            if (mode === 'implement') {
+              if (implementResult === 'success' && noChanges) {
+                const newTitle = RED + ' [AGENT:BLOCKED] ' + stripAllPrefixes(currentTitle);
+                try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number,
+                  body: `<!-- AGENT_BLOCKED -->\nAgent approval run produced no code changes and no PR.\n\nPlease adjust the issue and comment \`/agent approve\` again.\n\nStatus: AGENT:BLOCKED`
+                });
+                return;
+              }
+
+              if (implementResult === 'success' && branchAdvanced) {
+                const newTitle = GREEN + ' [AGENT:NEEDS-REVIEW] ' + stripAllPrefixes(currentTitle);
+                try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
+
+                if (prUrl) {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number,
+                    body: `Agent completed work and opened/updated a PR:\n\n${prUrl}\n\nStatus: AGENT:NEEDS-REVIEW`
+                  });
+                }
+                return;
+              }
+
+              if (implementResult === 'success' && !branchAdvanced && !noChanges) {
+                const newTitle = GREEN + ' [AGENT:NEEDS-REVIEW] ' + stripAllPrefixes(currentTitle);
+                try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number,
+                  body: `Agent implementation run did not push new commits (branch already contained the correct content).\n\nBranch ${process.env.BRANCH_NAME} is ahead of ${process.env.DEFAULT_BRANCH} and ready for review.\n\nPre-push SHA: ${prePushBranchSha || '(none)'}\n\nStatus: AGENT:NEEDS-REVIEW`
+                });
+                return;
+              }
+
+              if (implementResult === 'failure' && branchAdvanced) {
+                const newTitle = RED + ' [AGENT:BLOCKED] ' + stripAllPrefixes(currentTitle);
+                try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number,
+                  body: `<!-- AGENT_BLOCKED -->\nAgent hit the turn limit. Partial work has been committed to \`${process.env.BRANCH_NAME}\`. Comment \`/agent approve\` to continue from the current branch state.\n\nStatus: AGENT:BLOCKED`
+                });
+                return;
+              }
+
+              const newTitle = RED + ' [AGENT:BLOCKED] ' + stripAllPrefixes(currentTitle);
+              try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
+              await github.rest.issues.createComment({
+                owner, repo, issue_number,
+                body: `<!-- AGENT_BLOCKED -->\nAgent implementation run failed or did not produce the expected output.\n\nFor planning changes, comment \`/agent revise\`.\nFor implementation after approval, comment \`/agent approve\`.\n\nStatus: AGENT:BLOCKED`
+              });
+              return;
+            }
+
+            const newTitle = RED + ' [AGENT:BLOCKED] ' + stripAllPrefixes(currentTitle);
+            try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number,
+              body: '<!-- AGENT_BLOCKED -->\nAgent finalize run reached an unexpected state.\n\nPlease inspect the workflow and re-run from the issue once corrected.\n\nStatus: AGENT:BLOCKED'
+            });
+
+      - name: "Finalize: create or retitle PR after NEEDS-REVIEW"
+        if: ${{ needs.route.outputs.mode == 'implement' && needs.implement.result == 'success' && needs.implement.outputs.no_changes != 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          issue_title=$(gh issue view "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json title -q .title)
+          pr_body=$(cat <<EOF
+          Closes #${ISSUE_NUMBER}
+
+          Triggered by agent:ready label.
+          EOF
+          )
+          pr_url="${PR_URL:-}"
+
+          # Finalize is authoritative for PR existence.
+          # Prefer implement output if present, but always re-resolve defensively before create.
+          if [ -z "${pr_url}" ]; then
+            pr_url=$(gh pr list \
+              --repo "${GITHUB_REPOSITORY}" \
+              --state open \
+              --head "${BRANCH_NAME}" \
+              --base "${DEFAULT_BRANCH}" \
+              --json url \
+              -q '.[0].url' 2>/dev/null || true)
+          fi
+
+          if [ -n "${pr_url}" ]; then
+            pr_number="${pr_url##*/}"
+            gh pr edit "${pr_number}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --title "Agent: ${issue_title} (#${ISSUE_NUMBER})" \
+              --body "${pr_body}"
+          else
+            pr_url=$(gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
+              --base "${DEFAULT_BRANCH}" \
+              --head "${BRANCH_NAME}" \
+              --title "Agent: ${issue_title} (#${ISSUE_NUMBER})" \
+              --body "${pr_body}")
+          fi
+
+# noop: force org deploy rollout 2026-04-15T00:00:00
