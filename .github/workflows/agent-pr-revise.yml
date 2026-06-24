@@ -1,0 +1,378 @@
+name: Agent PR Revise
+
+on:
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  revise:
+    name: revise
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name == 'pull_request_review' &&
+      github.event.review.state == 'CHANGES_REQUESTED' &&
+      (
+        github.event.review.user.login == 'dsgowenjward' ||
+        github.event.review.user.login == 'dsg-mcp-server[bot]' ||
+        github.event.review.user.login == 'dsg-commenter[bot]' ||
+        github.event.review.user.login == 'dsg-agentic-assistant[bot]'
+      ) &&
+      github.event.pull_request.head.ref != github.event.repository.default_branch
+    timeout-minutes: 45
+
+    steps:
+      - name: Parse PR metadata
+        id: meta
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+            const headRef  = context.payload.pull_request.head.ref;
+            const baseRef  = context.payload.pull_request.base.ref;
+            const headSha  = context.payload.pull_request.head.sha;
+
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('head_ref', headRef);
+            core.setOutput('base_ref', baseRef);
+            core.setOutput('head_sha', headSha);
+            core.info(`PR #${prNumber}: ${headRef} → ${baseRef} @ ${headSha}`);
+
+      - name: Revision cycle guard
+        id: cycle_guard
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: prNumber, per_page: 100
+            });
+            const GATE_1_IDENTITIES = [
+              'github-actions[bot]',
+              'dsg-agentic-assistant[bot]',
+              'dsg-mcp-server[bot]',
+              'dsg-commenter[bot]',
+              'dsgowenjward',
+            ];
+            const botReviews = reviews.filter(
+              r => r.state === 'CHANGES_REQUESTED' &&
+                   GATE_1_IDENTITIES.includes(r.user.login)
+            );
+
+            // The triggering review is already in the list, so threshold is > 2
+            const cycleCount = botReviews.length;
+            core.info(`Revision cycle count: ${cycleCount}`);
+
+            if (cycleCount > 2) {
+              // Fetch current PR title and update to 🔴 [AGENT:BLOCKED]
+              const prData = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+              const currentTitle = prData.data.title || '';
+              const RED = '\uD83D\uDD34'; // 🔴
+              const cleaned = currentTitle.replace(/^[\uD83D\uDFE1\uD83D\uDD35\uD83D\uDFE2\uD83D\uDD34]?\s*\[AGENT:[^\]]+\]\s*/iu, '').trim();
+              const newTitle = RED + ' [AGENT:BLOCKED] ' + cleaned;
+              await github.rest.pulls.update({ owner, repo, pull_number: prNumber, title: newTitle });
+
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `<!-- AGENT_VERDICT --> ESCALATE — Max revision cycles (3) reached. Human review required.`
+              });
+              core.setOutput('escalate', 'true');
+            } else {
+              core.setOutput('escalate', 'false');
+            }
+
+      - name: Exit if escalating
+        if: steps.cycle_guard.outputs.escalate == 'true'
+        run: |
+          echo "Max revision cycles reached — escalating to human. Exiting."
+          exit 0
+
+      - name: Fetch review concerns
+        id: concerns
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+            const headSha  = '${{ steps.meta.outputs.head_sha }}';
+
+            const GATE_1_IDENTITIES = [
+              'github-actions[bot]',
+              'dsg-agentic-assistant[bot]',
+              'dsg-mcp-server[bot]',
+              'dsg-commenter[bot]',
+              'dsgowenjward',
+            ];
+
+            // Fetch the head commit timestamp so we can filter to only reviews
+            // submitted AFTER this commit was pushed. This prevents stale concerns
+            // from prior revise rounds from being re-sent to Claude when they have
+            // already been addressed in the current branch state.
+            let headCommitTimestamp = null;
+            try {
+              const commitData = await github.rest.repos.getCommit({
+                owner, repo, ref: headSha
+              });
+              headCommitTimestamp = commitData.data.commit.committer.date;
+              core.info(`Head commit (${headSha.slice(0, 8)}) committed at: ${headCommitTimestamp}`);
+            } catch (e) {
+              core.warning(`Could not fetch head commit timestamp: ${e.message}. Falling back to all reviews.`);
+            }
+
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: prNumber, per_page: 100
+            });
+
+            const concernReviews = reviews.filter(
+              r => r.state === 'CHANGES_REQUESTED' &&
+                   GATE_1_IDENTITIES.includes(r.user.login) &&
+                   r.body && r.body.trim() &&
+                   // Only include reviews submitted after the current head commit was pushed.
+                   // If we couldn't fetch the timestamp, fall back to including all reviews.
+                   (headCommitTimestamp === null || new Date(r.submitted_at) > new Date(headCommitTimestamp))
+            );
+
+            // Sort oldest-first so Claude sees concerns in chronological order
+            concernReviews.sort((a, b) => new Date(a.submitted_at) - new Date(b.submitted_at));
+
+            const concerns = concernReviews
+              .map((r, i) => `--- Review ${i + 1} (${r.user.login}, ${r.submitted_at}) ---\n${r.body.trim()}`)
+              .join('\n\n');
+
+            if (!concerns.trim()) {
+              core.setOutput('no_concerns', 'true');
+              core.warning('No CHANGES_REQUESTED reviews with content found after head commit timestamp.');
+            } else {
+              core.setOutput('no_concerns', 'false');
+            }
+            core.setOutput('concerns', concerns);
+            core.info(`Concerns aggregated from ${concernReviews.length} review(s) (${concerns.length} chars)`);
+
+      - name: Exit if no actionable concerns
+        if: steps.concerns.outputs.no_concerns == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: '<!-- AGENT_PR_REVISED -->\nNo actionable review concerns were found. No changes were made.'
+            });
+            core.info('No concerns — exiting early.');
+
+      - name: Checkout PR branch
+        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.DSG_BOT_TOKEN }}
+          ref: ${{ steps.meta.outputs.head_ref }}
+          fetch-depth: 0
+
+      - name: Configure git identity
+        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        run: |
+          git config user.name  "dsg-bot"
+          git config user.email "dsg-bot@users.noreply.github.com"
+
+      - name: Gather linked issue context
+        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p .agent
+
+          # Parse PR body for "Closes #N" or "Fixes #N"
+          PR_BODY="$(gh pr view "${{ steps.meta.outputs.pr_number }}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json body --jq '.body')"
+
+          LINKED_ISSUE="$(echo "${PR_BODY}" | grep -oiE '(closes|fixes|resolves)[[:space:]]+#[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
+
+          # Guard against issue number 0 — GitHub issue numbers start at 1.
+          # "Closes #0" in a PR body (e.g. a placeholder comment) would otherwise
+          # cause `gh issue view 0` to fail with a GraphQL error and exit 1.
+          if [ -n "${LINKED_ISSUE}" ] && [ "${LINKED_ISSUE}" != "0" ]; then
+            echo "Linked issue: #${LINKED_ISSUE}"
+            gh issue view "${LINKED_ISSUE}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json title,body,comments \
+              > .agent/issue-context.json
+          else
+            echo "No linked issue found; writing stub."
+            echo '{"title":"(no linked issue)","body":"","comments":[]}' > .agent/issue-context.json
+          fi
+
+      - name: Capture pre-push SHA
+        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        id: pre_push_sha
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          echo "pre_push_sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "Pre-push SHA: ${sha}"
+
+      - name: Revision agent
+        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        id: claude
+        continue-on-error: true
+        uses: ./.github/actions/coding-agent
+        with:
+          api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          issue-context: .agent/issue-context.json
+          branch-name: ${{ steps.meta.outputs.head_ref }}
+          issue-number: ${{ steps.meta.outputs.pr_number }}
+          max-turns: "25"
+          mode: revise
+          review-concerns: ${{ steps.concerns.outputs.concerns }}
+
+      - name: Warn if Claude Code failed
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.claude.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: [
+                '<!-- AGENT_REVISE_ERROR -->',
+                '⚠️ **Agent step failed during revision** — the safety-net noop commit was pushed to keep CI alive, but no code changes were made.',
+                '',
+                'Check the [workflow run logs](' +
+                  `https://github.com/${owner}/${repo}/actions/runs/${{ github.run_id }}` +
+                  ') for the root cause.'
+              ].join('\n')
+            });
+
+      - name: Safety-net commit and cleanup
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Never allow agent to modify canonical control files — leave repo-specific workflows untouched
+          for f in ci.yml code-agent.yml issue-deploy-lifecycle.yml lifecycle-bootstrap.yml agent-pr-ci-summary.yml agent-pr-revise.yml agent-pr-review.yml agent-pr-claude-verdict.yml agent-merge.yml; do
+            git restore --staged --worktree ".github/workflows/${f}" 2>/dev/null || true
+          done
+          rm -rf .agent .claude-pr
+
+          # Commit any uncommitted working tree changes left by Claude
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Working tree changes detected; creating safety-net commit."
+            git add -A
+            git commit -m "Agent: revise PR #${{ steps.meta.outputs.pr_number }}"
+          else
+            echo "No uncommitted working tree changes."
+          fi
+
+          # Fallback: if this run produced no new commit, force a no-op commit to re-trigger CI
+          PRE_PUSH_SHA="${{ steps.pre_push_sha.outputs.pre_push_sha }}"
+          CURRENT_SHA="$(git rev-parse HEAD)"
+
+          if [ "${CURRENT_SHA}" = "${PRE_PUSH_SHA}" ]; then
+            echo "No new commits produced this run — creating no-op commit to re-trigger CI."
+            echo "# agent-pr-revise no-op: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .agent-noop
+            git add .agent-noop
+            git commit -m "chore: re-trigger CI after revision cycle (no changes needed)"
+          fi
+
+      - name: Push branch
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git push origin "${{ steps.meta.outputs.head_ref }}"
+
+      - name: Capture post-revision diff
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true'
+        id: actual_diff
+        shell: bash
+        run: |
+          set -euo pipefail
+          PRE_SHA="${{ steps.pre_push_sha.outputs.pre_push_sha }}"
+          POST_SHA="$(git rev-parse HEAD)"
+          echo "post_sha=${POST_SHA}" >> "$GITHUB_OUTPUT"
+
+          if [ "${PRE_SHA}" = "${POST_SHA}" ]; then
+            echo "diff_summary=No file changes were made this revision cycle." >> "$GITHUB_OUTPUT"
+          else
+            DIFF="$(git diff "${PRE_SHA}".."${POST_SHA}" -- . ':(exclude).agent-noop' | head -200)"
+            if [ -z "${DIFF}" ]; then
+              echo "diff_summary=No file changes were made this revision cycle." >> "$GITHUB_OUTPUT"
+            else
+              echo "${DIFF}" > /tmp/agent_diff.txt
+              {
+                echo 'diff_summary<<EOF'
+                cat /tmp/agent_diff.txt
+                echo 'EOF'
+              } >> "$GITHUB_OUTPUT"
+            fi
+          fi
+
+      - name: Post revision summary comment
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true'
+        uses: actions/github-script@v7
+        env:
+          CONCERNS: ${{ steps.concerns.outputs.concerns }}
+          DIFF_SUMMARY: ${{ steps.actual_diff.outputs.diff_summary }}
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+            const preSha = '${{ steps.pre_push_sha.outputs.pre_push_sha }}';
+            const postSha = '${{ steps.actual_diff.outputs.post_sha }}';
+            const diffSummary = process.env.DIFF_SUMMARY || 'No diff captured.';
+            const concerns = process.env.CONCERNS || '';
+
+            const changesSection = preSha === postSha
+              ? 'No file changes were committed this revision cycle (no-op).'
+              : `\`\`\`diff\n${diffSummary}\n\`\`\``;
+
+            const body = [
+              '<!-- AGENT_PR_REVISED -->',
+              `**Revision complete** — HEAD: \`${postSha.slice(0,7)}\``,
+              '',
+              '**Changes made:**',
+              changesSection,
+              '',
+              '<details><summary>Review concerns that were addressed</summary>',
+              '',
+              concerns,
+              '',
+              '</details>',
+              '',
+              'The CI + review cycle will re-run automatically.'
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body
+            });
