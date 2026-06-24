@@ -1,0 +1,52 @@
+name: Lifecycle Bootstrap
+
+# This workflow is the STABLE BOOTSTRAP for the DSG lifecycle system.
+# Its only job is to receive trigger events and invoke the reconciler.
+# It contains NO lifecycle decision logic — only event triggers.
+# Keep this file minimal and stable. Lifecycle logic lives in issue-deploy-lifecycle.yml.
+
+on:
+  pull_request:
+    types: [closed]
+  push:
+    branches: [main]
+  workflow_run:
+    workflows:
+      - "Deploy Agent + CI to Org"
+      - "Deploy (SAM)"
+      - "Deploy Anedot (SAM)"
+      - "Deploy NationBuilder (SAM)"
+      - "Terraform Deploy"
+      - "Terraform Deploy (FPC Tier 1)"
+      - "Terraform Deploy (FPC Analytics)"
+      - "Deploy Analytics Frontend (FPC)"
+      - "Frontend Deploy"
+      - "Deploy Analytics Compute (FPC)"
+      - "Deploy"
+      - "quicksight-deploy"
+    types: [completed]
+  workflow_dispatch:
+  repository_dispatch:
+    types: [lifecycle-deploy-signal]
+
+jobs:
+  bootstrap:
+    permissions:
+      actions: read
+      contents: read
+      issues: write
+      pull-requests: read
+    uses: ./.github/workflows/issue-deploy-lifecycle.yml
+    with:
+      event_name: ${{ github.event_name }}
+      pr_number: ${{ github.event.pull_request.number || '' }}
+      pr_merged: ${{ github.event.pull_request.merged || '' }}
+      push_sha: ${{ github.event.after || '' }}
+      workflow_run_name: ${{ github.event.workflow_run.name || '' }}
+      workflow_run_conclusion: ${{ github.event.workflow_run.conclusion || '' }}
+      workflow_run_sha: ${{ github.event.workflow_run.head_sha || '' }}
+      dispatch_set_id: ${{ github.event.client_payload.set_id || '' }}
+      dispatch_conclusion: ${{ github.event.client_payload.conclusion || '' }}
+      dispatch_sha: ${{ github.event.client_payload.sha || '' }}
+      dispatch_issue_numbers: ${{ toJSON(github.event.client_payload.issue_numbers) || '[]' }}
+    secrets: inherit
