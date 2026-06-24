@@ -1,0 +1,581 @@
+name: Agent PR CI Summary
+
+on:
+  check_suite:
+    types:
+      - completed
+  pull_request:
+    types:
+      - opened
+      - synchronize
+  status: {}
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  checks: read
+  statuses: read
+  actions: read
+
+concurrency:
+  group: agent-pr-ci-summary-${{ github.event.pull_request.number || github.event.check_suite.pull_requests[0].number || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  summarize:
+    name: summarize-pr-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve PR context
+        id: resolve
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const eventName = context.eventName;
+            const payload = context.payload;
+
+            async function getPrNumber() {
+              if (payload.pull_request?.number) return payload.pull_request.number;
+
+              if (context.eventName === 'check_suite') {
+                const prNum = payload.check_suite?.pull_requests?.[0]?.number;
+                if (prNum) return prNum;
+                // Fall back: find open PR matching head_sha
+                const sha = payload.check_suite?.head_sha;
+                if (sha) {
+                  const { owner, repo } = context.repo;
+                  const prs = await github.rest.pulls.list({
+                    owner, repo, state: 'open', per_page: 100
+                  });
+                  const match = prs.data.find(pr => pr.head.sha === sha);
+                  if (match) return match.number;
+                }
+                return null;
+              }
+
+              // status event: find open PR for this commit SHA
+              if (context.eventName === 'status' && context.payload.sha) {
+                const sha = context.payload.sha;
+                const { owner, repo } = context.repo;
+                const prs = await github.rest.pulls.list({
+                  owner, repo, state: 'open', per_page: 100
+                });
+                // First check if SHA matches any PR's current head
+                const headMatch = prs.data.find(pr => pr.head.sha === sha);
+                if (headMatch) return headMatch.number;
+                // Fallback: search commit history of each open PR (covers Amazon Q posting
+                // a status against an older commit SHA after a revision push)
+                for (const pr of prs.data) {
+                  try {
+                    const commits = await github.rest.pulls.listCommits({
+                      owner, repo, pull_number: pr.number, per_page: 100
+                    });
+                    if (commits.data.some(c => c.sha === sha)) return pr.number;
+                  } catch (e) {
+                    core.warning(`listCommits failed for PR #${pr.number}: ${e.message}`);
+                  }
+                }
+                return null;
+              }
+
+              return null;
+            }
+
+            const prNumber = await getPrNumber();
+            if (!prNumber) {
+              core.setOutput('skip', 'true');
+              return;
+            }
+
+            const { owner, repo } = context.repo;
+            const pr = await github.rest.pulls.get({
+              owner,
+              repo,
+              pull_number: prNumber
+            });
+
+            const headSha = pr.data.head.sha;
+            const body = pr.data.body || '';
+            const linkedIssueMatch = body.match(/(?:close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)\s+#(\d+)/i);
+            const linkedIssue = linkedIssueMatch ? Number(linkedIssueMatch[1]) : null;
+
+            core.setOutput('skip', 'false');
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('head_sha', headSha);
+            core.setOutput('linked_issue', linkedIssue ? String(linkedIssue) : '');
+
+      - name: Stop if no PR was resolved
+        if: steps.resolve.outputs.skip == 'true'
+        run: |
+          echo "No PR context resolved for this event. Exiting."
+
+      - name: Build CI summary and ready payload
+        if: steps.resolve.outputs.skip != 'true'
+        id: build
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = Number('${{ steps.resolve.outputs.pr_number }}');
+            const headSha = '${{ steps.resolve.outputs.head_sha }}';
+            const linkedIssueRaw = '${{ steps.resolve.outputs.linked_issue }}';
+            const linkedIssue = linkedIssueRaw ? Number(linkedIssueRaw) : null;
+
+            const combined = await github.rest.repos.getCombinedStatusForRef({
+              owner,
+              repo,
+              ref: headSha
+            });
+
+            const checks = await github.rest.checks.listForRef({
+              owner,
+              repo,
+              ref: headSha,
+              per_page: 100
+            });
+
+            const statusContexts = (combined.data.statuses || []).map((status) => ({
+              type: 'status',
+              name: status.context,
+              status: status.state,
+              conclusion: status.state,
+              details_url: status.target_url || '',
+              summary: status.description || '',
+              text: status.description || ''
+            }));
+
+            const checkRuns = (checks.data.check_runs || []).map((run) => ({
+              type: 'check_run',
+              name: run.name,
+              status: run.status,
+              conclusion: run.conclusion || '',
+              details_url: run.details_url || '',
+              summary: run.output?.summary || '',
+              text: run.output?.text || ''
+            }));
+
+            // E. Exclude pipeline-internal check runs — these are not CI quality gates
+            const PIPELINE_CHECKS = new Set([
+              'summarize-pr-ci',   // agent-pr-ci-summary.yml
+              'review',            // agent-pr-review.yml
+              'revise',            // agent-pr-revise.yml
+              'merge',             // agent-merge.yml
+              'claude-verdict',    // agent-pr-claude-verdict.yml
+            ]);
+
+            let allEntries = [...statusContexts, ...checkRuns]
+              .filter(e => !PIPELINE_CHECKS.has(e.name));
+
+            // F. Amazon Q scope config — look for Amazon Q status across all PR commits
+            // (Amazon Q posts against the original commit SHA, not the revision SHA)
+            const REVIEWER_CONFIG = {
+              'Amazon Q Developer': { scope: 'pr' },
+            };
+
+            // Track entries found on prior commit SHAs so we can preserve them across
+            // poll iterations (Fix #5: merge instead of replace in poll loop).
+            const priorShaEntries = new Map(); // name -> entry
+
+            for (const [reviewerName, config] of Object.entries(REVIEWER_CONFIG)) {
+              if (config.scope !== 'pr') continue;
+              // Check if already present on head SHA
+              const alreadyPresent = allEntries.some(e => e.name === reviewerName);
+              if (alreadyPresent) continue;
+              // Search across all PR commit SHAs for this reviewer's status/check
+              try {
+                const prCommits = await github.rest.pulls.listCommits({
+                  owner,
+                  repo,
+                  pull_number: prNumber,
+                  per_page: 100
+                });
+                // Search oldest-to-newest, use last match found
+                let foundEntry = null;
+                for (const commit of prCommits.data) {
+                  if (commit.sha === headSha) continue; // already checked
+                  const combinedForSha = await github.rest.repos.getCombinedStatusForRef({
+                    owner, repo, ref: commit.sha
+                  });
+                  const matchingStatus = (combinedForSha.data.statuses || [])
+                    .find(s => s.context === reviewerName);
+                  if (matchingStatus) {
+                    foundEntry = {
+                      type: 'status',
+                      name: matchingStatus.context,
+                      status: matchingStatus.state,
+                      conclusion: matchingStatus.state,
+                      details_url: matchingStatus.target_url || '',
+                      summary: matchingStatus.description || '',
+                      text: matchingStatus.description || ''
+                    };
+                  }
+                  // Also check check runs for this SHA
+                  const checksForSha = await github.rest.checks.listForRef({
+                    owner, repo, ref: commit.sha, per_page: 100
+                  });
+                  const matchingCheck = (checksForSha.data.check_runs || [])
+                    .find(r => r.name === reviewerName);
+                  if (matchingCheck) {
+                    foundEntry = {
+                      type: 'check_run',
+                      name: matchingCheck.name,
+                      status: matchingCheck.status,
+                      conclusion: matchingCheck.conclusion || '',
+                      details_url: matchingCheck.details_url || '',
+                      summary: matchingCheck.output?.summary || '',
+                      text: matchingCheck.output?.text || ''
+                    };
+                  }
+                }
+                if (foundEntry) {
+                  core.info(`Found ${reviewerName} status on prior commit SHA — including in allEntries.`);
+                  allEntries.push(foundEntry);
+                  priorShaEntries.set(reviewerName, foundEntry);
+                }
+              } catch (e) {
+                core.warning(`REVIEWER_CONFIG PR-scope lookup failed for ${reviewerName}: ${e.message}`);
+              }
+            }
+
+            const terminalStates = new Set([
+              'success',
+              'failure',
+              'neutral',
+              'cancelled',
+              'skipped',
+              'timed_out',
+              'action_required'
+            ]);
+            const pendingStatuses = new Set([
+              'queued',
+              'in_progress',
+              'pending',
+              'requested',
+              'waiting'
+            ]);
+
+            function isTerminal(entry) {
+              if (entry.type === 'status') {
+                return terminalStates.has(entry.status);
+              }
+
+              if (!entry.status || entry.status === 'completed') {
+                return terminalStates.has(entry.conclusion || 'success');
+              }
+
+              return false;
+            }
+
+            function isPending(entry) {
+              if (entry.type === 'status') {
+                return pendingStatuses.has(entry.status);
+              }
+
+              return entry.status && entry.status !== 'completed';
+            }
+
+            function isFailure(entry) {
+              const value = entry.type === 'status' ? entry.status : entry.conclusion;
+              return ['failure', 'timed_out', 'cancelled', 'action_required'].includes(value);
+            }
+
+            const pending = allEntries.filter(isPending);
+            let failures = allEntries.filter(isFailure);
+
+            let allComplete =
+              allEntries.length > 0 &&
+              pending.length === 0 &&
+              allEntries.every(isTerminal);
+
+            // D. Poll until all checks are terminal, up to 5 minutes. If they never
+            //    settle, post an escalation comment and exit so Owen can investigate.
+            const POLL_INTERVAL_MS = 20_000;  // 20 seconds between polls
+            const POLL_TIMEOUT_MS  = 5 * 60 * 1000; // 5 minutes total
+            const pollStart = Date.now();
+
+            while (!allComplete) {
+              const elapsed = Date.now() - pollStart;
+              if (elapsed >= POLL_TIMEOUT_MS) {
+                // Escalate: post a comment on the PR so Owen is alerted
+                const pendingNames = allEntries.filter(isPending).map(e => e.name).join(', ');
+                await github.rest.issues.createComment({
+                  owner,
+                  repo,
+                  issue_number: prNumber,
+                  body: [
+                    '<!-- AGENT_CI_STALLED -->',
+                    '',
+                    `@dsgowenjward — CI Summary has been waiting for checks to complete for over 5 minutes on PR #${prNumber} and they are still pending. Manual intervention required.`,
+                    '',
+                    `**Still pending after ${Math.round(elapsed / 1000)}s:** ${pendingNames}`,
+                    `**Head SHA:** ${headSha}`,
+                    '',
+                    'The pipeline is stalled. Please investigate the pending checks above and re-run this workflow once they resolve.',
+                  ].join('\n'),
+                });
+                core.setOutput('skip_post', 'true');
+                core.warning(`CI checks still pending after ${Math.round(elapsed / 1000)}s — escalation comment posted on PR #${prNumber}. Exiting.`);
+                return;
+              }
+
+              core.info(`Not all checks terminal (pending: ${allEntries.filter(isPending).length}/${allEntries.length}). Waiting ${POLL_INTERVAL_MS / 1000}s before retry... (elapsed: ${Math.round(elapsed / 1000)}s)`);
+              await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
+
+              // Re-fetch checks for head SHA
+              const freshCombined = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: headSha });
+              const freshChecks   = await github.rest.checks.listForRef({ owner, repo, ref: headSha, per_page: 100 });
+
+              const freshStatusContexts = (freshCombined.data.statuses || []).map(s => ({
+                type: 'status', name: s.context, status: s.state, conclusion: s.state,
+                details_url: s.target_url || '', summary: s.description || '', text: s.description || ''
+              }));
+              const freshCheckRuns = (freshChecks.data.check_runs || []).map(r => ({
+                type: 'check_run', name: r.name, status: r.status, conclusion: r.conclusion || '',
+                details_url: r.details_url || '', summary: r.output?.summary || '', text: r.output?.text || ''
+              }));
+
+              // Fix #5: Merge rather than replace — preserve prior-SHA entries (e.g. Amazon Q)
+              // that will never appear on the head SHA re-fetch. Build a fresh set from head SHA,
+              // then add back any prior-SHA entries whose name is not already present.
+              const freshHeadEntries = [...freshStatusContexts, ...freshCheckRuns]
+                .filter(e => !PIPELINE_CHECKS.has(e.name));
+              const freshNames = new Set(freshHeadEntries.map(e => e.name));
+              const preserved = [...priorShaEntries.values()].filter(e => !freshNames.has(e.name));
+              allEntries = [...freshHeadEntries, ...preserved];
+
+              allComplete =
+                allEntries.length > 0 &&
+                allEntries.filter(isPending).length === 0 &&
+                allEntries.every(isTerminal);
+            }
+
+            failures = allEntries.filter(isFailure);
+
+            core.setOutput('skip_post', 'false');
+            const ciResult = failures.length > 0 ? 'failure' : 'success';
+
+            function trimText(value, max = 1500) {
+              if (!value) return '';
+              const cleaned = String(value).trim();
+              return cleaned.length <= max
+                ? cleaned
+                : cleaned.slice(0, max) + '\n...[truncated]';
+            }
+
+            async function fetchJobLogs(entry) {
+              if (entry.type !== 'check_run' || !entry.details_url) return null;
+              const match = entry.details_url.match(/\/actions\/runs\/(\d+)\/jobs\/(\d+)/);
+              if (!match) return null;
+              const run_id = Number(match[1]);
+              const job_id = Number(match[2]);
+              try {
+                const resp = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                  owner, repo, run_id, job_id
+                });
+                const logText = resp.data;
+                if (!logText) return null;
+                if (typeof logText !== 'string') {
+                  core.warning(`fetchJobLogs: unexpected resp.data type '${typeof logText}' for job_id=${job_id}`);
+                  return null;
+                }
+                core.info(`fetchJobLogs: retrieved ${logText.length} chars for job_id=${job_id}`);
+                const lines = logText.split('\n');
+                return lines.slice(-80).join('\n');
+              } catch (e) {
+                core.warning(`fetchJobLogs: failed for job_id=${job_id}: ${e.message}`);
+                return null;
+              }
+            }
+
+            const summaryLines = [];
+            summaryLines.push('<!-- AGENT_CI_SUMMARY -->');
+            summaryLines.push('');
+            summaryLines.push(`PR_NUMBER: ${prNumber}`);
+            summaryLines.push(`HEAD_SHA: ${headSha}`);
+            summaryLines.push(`LINKED_ISSUE: ${linkedIssue ?? ''}`);
+            summaryLines.push(`CI_RESULT: ${ciResult}`);
+            summaryLines.push(`ALL_CHECKS_COMPLETE: ${allComplete ? 'true' : 'false'}`);
+            summaryLines.push('');
+            summaryLines.push('## Agent CI Summary');
+            summaryLines.push('');
+
+            if (ciResult === 'success') {
+              summaryLines.push('All tracked checks for the current PR head SHA have completed successfully.');
+              summaryLines.push('');
+            } else {
+              summaryLines.push('One or more checks failed for the current PR head SHA.');
+              summaryLines.push('');
+            }
+
+            summaryLines.push('## Checks');
+            summaryLines.push('');
+
+            if (allEntries.length === 0) {
+              summaryLines.push('- No status contexts or check runs were found yet for this head SHA.');
+            } else {
+              for (const entry of allEntries) {
+                const state = entry.type === 'status'
+                  ? entry.status
+                  : `${entry.status}/${entry.conclusion || 'n/a'}`;
+                summaryLines.push(`- **${entry.name}** - ${state}`);
+                const checkSummary = entry.summary || entry.text || '';
+                if (checkSummary) {
+                  summaryLines.push(`  - Summary: ${trimText(checkSummary, 400)}`);
+                }
+                if (entry.details_url) {
+                  summaryLines.push(`  - Details: ${entry.details_url}`);
+                }
+              }
+            }
+
+            if (failures.length > 0) {
+              summaryLines.push('');
+              summaryLines.push('## Surfaced Failure Details');
+              summaryLines.push('');
+              for (const entry of failures) {
+                summaryLines.push(`### ${entry.name}`);
+                summaryLines.push('');
+                let rawText = entry.text || entry.summary || '';
+                if (!rawText && entry.type === 'check_run') {
+                  const fetched = await fetchJobLogs(entry);
+                  if (fetched) {
+                    rawText = fetched;
+                  } else {
+                    rawText = 'No failure text was surfaced by GitHub for this check. Log fetch was attempted but unavailable.';
+                  }
+                } else if (!rawText) {
+                  rawText = 'No failure text was surfaced by GitHub for this check.';
+                }
+                const text = trimText(rawText);
+                summaryLines.push('```text');
+                summaryLines.push(text);
+                summaryLines.push('```');
+                if (entry.details_url) {
+                  summaryLines.push('');
+                  summaryLines.push(`Details: ${entry.details_url}`);
+                }
+                summaryLines.push('');
+              }
+            }
+
+            const readyLines = [];
+            readyLines.push('<!-- AGENT_PR_READY -->');
+            readyLines.push('');
+            readyLines.push(`PR_NUMBER: ${prNumber}`);
+            readyLines.push(`LINKED_ISSUE: ${linkedIssue ?? ''}`);
+            readyLines.push(`HEAD_SHA: ${headSha}`);
+            readyLines.push(`CHECKS_COMPLETE: ${allComplete ? 'true' : 'false'}`);
+            readyLines.push(`CI_RESULT: ${ciResult}`);
+            readyLines.push(`READY_FOR_AGENT_REVIEW: ${allComplete ? 'true' : 'false'}`);
+            readyLines.push('');
+            readyLines.push('This comment is the machine trigger for the PR review worker.');
+
+            core.setOutput('summary_body', summaryLines.join('\n'));
+            core.setOutput('ready_body', readyLines.join('\n'));
+            core.setOutput('all_complete', 'true');
+            core.setOutput('ci_result', ciResult);
+
+      - name: Post AGENT_CI_SUMMARY comment
+        if: steps.resolve.outputs.skip != 'true' && steps.build.outputs.skip_post != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = Number('${{ steps.resolve.outputs.pr_number }}');
+            const body = ${{ toJson(steps.build.outputs.summary_body) }};
+
+            // Append-only: never delete prior summaries — historical CI run data must be preserved
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body
+            });
+
+      - name: Post AGENT_PR_READY comment when checks are terminal
+        if: steps.resolve.outputs.skip != 'true' && steps.build.outputs.skip_post != 'true' && steps.build.outputs.all_complete == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = Number('${{ steps.resolve.outputs.pr_number }}');
+            const headSha = '${{ steps.resolve.outputs.head_sha }}';
+            const body = ${{ toJson(steps.build.outputs.ready_body) }};
+
+            // Fix #3: Suppress AGENT_PR_READY when the most recent AGENT_PR_REVISED comment
+            // indicates a noop revision cycle for this exact head SHA. A noop means the revise
+            // agent made no real changes — re-triggering Gate 1 would restart an oscillation loop.
+            try {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number, per_page: 100
+              });
+              const revisedComments = comments.filter(c =>
+                typeof c.body === 'string' && c.body.startsWith('<!-- AGENT_PR_REVISED -->')
+              );
+              if (revisedComments.length > 0) {
+                const latest = revisedComments[revisedComments.length - 1];
+                const isNoop = latest.body.includes('No file changes were committed this revision cycle (no-op).');
+                if (isNoop) {
+                  core.warning(
+                    `Suppressing AGENT_PR_READY: most recent AGENT_PR_REVISED comment is a noop for PR #${issue_number} ` +
+                    `(head SHA: ${headSha}). Gate 1 re-trigger would restart oscillation loop.`
+                  );
+                  return;
+                }
+              }
+
+              // Dedup: skip if AGENT_PR_READY for this HEAD_SHA already posted
+              const readyAlreadyPosted = comments.some(c =>
+                typeof c.body === 'string' &&
+                c.body.startsWith('<!-- AGENT_PR_READY -->') &&
+                c.body.includes(`HEAD_SHA: ${headSha}`)
+              );
+              if (readyAlreadyPosted) {
+                core.info(`AGENT_PR_READY for HEAD_SHA ${headSha} already posted on PR #${issue_number}. Skipping duplicate.`);
+                return;
+              }
+            } catch (e) {
+              core.warning(`Noop suppression check failed (proceeding with AGENT_PR_READY): ${e.message}`);
+            }
+
+            // Guard: wait for agent-pr-revise.yml to be indexed by GitHub Actions
+            const GUARD_FILE = '.github/workflows/agent-pr-revise.yml';
+            const THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+            try {
+              const commits = await github.rest.repos.listCommits({
+                owner,
+                repo,
+                path: GUARD_FILE,
+                per_page: 1
+              });
+              if (commits.data.length > 0) {
+                const committedAt = commits.data[0].commit.committer.date;
+                const committedMs = new Date(committedAt).getTime();
+                const nowMs = Date.now();
+                const ageMs = nowMs - committedMs;
+                if (ageMs < THRESHOLD_MS) {
+                  const waitMs = THRESHOLD_MS - ageMs;
+                  core.info(`agent-pr-revise.yml is only ${Math.round(ageMs / 1000)}s old on main. Waiting ${Math.round(waitMs / 1000)}s for GitHub Actions indexing...`);
+                  await new Promise(resolve => setTimeout(resolve, waitMs));
+                }
+              }
+            } catch (e) {
+              core.warning(`Guard check for agent-pr-revise.yml age failed (proceeding anyway): ${e.message}`);
+            }
+
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body
+            });
