@@ -1,0 +1,223 @@
+name: Agent PR Merge Executor
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write          # required for pulls.merge() API call — must be first
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: agent-merge-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  merge:
+    name: merge
+    runs-on: ubuntu-latest
+    if: >
+      github.event.issue.pull_request != null &&
+      startsWith(github.event.comment.body, '<!-- AGENT_VERDICT --> MERGE')
+    timeout-minutes: 10
+
+    steps:
+      - name: Parse trigger comment
+        id: parse
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const body = context.payload.comment.body;
+            const prNumber = context.payload.issue.number;
+
+            // Extract confidence if present (e.g. confidence: HIGH or "confidence": "LOW")
+            const confidenceMatch = body.match(/(?:"confidence"\s*:\s*"(\w+)"|confidence:\s*(\w+))/i);
+            const confidence = confidenceMatch
+              ? (confidenceMatch[1] || confidenceMatch[2]).toUpperCase()
+              : 'ACCEPTABLE';
+
+            // Strip the marker line to get the verdict summary
+            const verdictSummary = body.replace(/^<!--\s*AGENT_VERDICT\s*-->\s*MERGE\s*/i, '').trim();
+
+            core.setOutput('pr_number', String(prNumber));
+            core.setOutput('confidence', confidence);
+            core.setOutput('verdict_summary', verdictSummary);
+            core.info(`PR: ${prNumber}, confidence: ${confidence}`);
+
+      - name: Idempotency guard
+        id: guard
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.parse.outputs.pr_number }}');
+
+            const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+
+            if (pr.merged) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: '<!-- AGENT_MERGE_COMPLETE -->\nAlready merged — skipping.'
+              });
+              core.setOutput('already_merged', 'true');
+              return;
+            }
+
+            if (pr.state === 'closed') {
+              const { data: repoData } = await github.rest.repos.get({ owner, repo });
+              const repoOwner = repoData.owner.login;
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `<!-- AGENT_VERDICT --> ESCALATE\n\n@${repoOwner} — Human review required. Agent merge aborted.\n\n**Reason:** PR is closed but not merged.`
+              });
+              core.setOutput('already_merged', 'true');
+              return;
+            }
+
+            core.setOutput('already_merged', 'false');
+            core.setOutput('pr_title', pr.title);
+            core.setOutput('pr_body', pr.body || '');
+            core.setOutput('head_sha', pr.head.sha);
+
+      - name: Fetch gate data
+        if: steps.guard.outputs.already_merged != 'true'
+        id: gates
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.parse.outputs.pr_number }}');
+
+            // Human review gate: check for CHANGES_REQUESTED from non-bot users
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner, repo, pull_number: prNumber, per_page: 100
+            });
+
+            const humanChangesRequested = reviews.some(
+              r => r.state === 'CHANGES_REQUESTED' && r.user?.type !== 'Bot'
+            );
+
+            core.setOutput('human_changes_requested', String(humanChangesRequested));
+
+            core.info(`human_changes_requested: ${humanChangesRequested}`);
+
+      - name: Evaluate gates and merge
+        if: steps.guard.outputs.already_merged != 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.parse.outputs.pr_number }}');
+            const prTitle = ${{ toJson(steps.guard.outputs.pr_title) }};
+            const prBody = ${{ toJson(steps.guard.outputs.pr_body) }};
+            const verdictSummary = ${{ toJson(steps.parse.outputs.verdict_summary) }};
+            const confidence = '${{ steps.parse.outputs.confidence }}';
+            const humanChangesRequested = '${{ steps.gates.outputs.human_changes_requested }}' === 'true';
+
+            const { data: repoData } = await github.rest.repos.get({ owner, repo });
+            const repoOwner = repoData.owner.login;
+
+            // Evaluate all gates
+            const failures = [];
+
+            if (humanChangesRequested) {
+              failures.push('One or more human reviewers have requested changes');
+            }
+
+            if (confidence === 'LOW') {
+              failures.push('DSG Agent confidence is LOW');
+            }
+
+            if (failures.length > 0) {
+              const failureList = failures.map(f => `- ${f}`).join('\n');
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `<!-- AGENT_VERDICT --> ESCALATE\n\n@${repoOwner} — Human review required. Agent merge aborted.\n\n**Failed gates:**\n${failureList}`
+              });
+              core.info(`Merge aborted. Failed gates:\n${failureList}`);
+              return;
+            }
+
+            // All gates passed — re-validate head SHA before merging (close the race condition window)
+            const headSha = '${{ steps.guard.outputs.head_sha }}';
+            const { data: currentPr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            if (currentPr.head.sha !== headSha) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `<!-- AGENT_VERDICT --> ESCALATE\n\n@${repoOwner} — Human review required. Agent merge aborted.\n\n**Reason:** PR head SHA changed after gate validation (expected ${headSha}, found ${currentPr.head.sha})`
+              });
+              core.info(`Merge aborted: head SHA changed (expected ${headSha}, found ${currentPr.head.sha})`);
+              return;
+            }
+
+            // All gates passed and SHA confirmed — attempt squash merge
+            core.info('All gates passed. Attempting squash merge.');
+            let mergeResponse;
+            try {
+              mergeResponse = await github.rest.pulls.merge({
+                owner,
+                repo,
+                pull_number: prNumber,
+                merge_method: 'squash',
+                commit_title: `${prTitle} (#${prNumber})`,
+                commit_message: verdictSummary
+              });
+              core.info('Merge succeeded.');
+            } catch (mergeError) {
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: `<!-- AGENT_VERDICT --> ESCALATE\n\n@${repoOwner} — Merge failed. Human intervention required.\n\n**Error:** ${mergeError.message}`
+              });
+              core.info(`Merge failed: ${mergeError.message}`);
+              return;
+            }
+
+            const mergeSha = mergeResponse.data.sha;
+            const mergeCompleteBody = `<!-- AGENT_MERGE_COMPLETE -->\n\n✅ Auto-merge complete for PR #${prNumber} ([view PR](${currentPr.html_url}))\n\n**Merge SHA:** \`${mergeSha}\`\n\nThe agentic pipeline completed end-to-end successfully.`;
+
+            // Post completion comment to linked issue (or PR as fallback) and close linked issue
+            const linkedIssueMatch = prBody.match(/(?:closes|fixes|resolves)\s+#(\d+)/i);
+            if (linkedIssueMatch) {
+              const linkedIssue = Number(linkedIssueMatch[1]);
+              try {
+                // Dedup: skip if AGENT_MERGE_COMPLETE already posted on the linked issue
+                const issueComments = await github.rest.issues.listComments({
+                  owner, repo, issue_number: linkedIssue, per_page: 100
+                });
+                if (issueComments.data.some(c => typeof c.body === 'string' && c.body.startsWith('<!-- AGENT_MERGE_COMPLETE -->'))) {
+                  core.info(`AGENT_MERGE_COMPLETE already posted on issue #${linkedIssue}. Skipping duplicate.`);
+                } else {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: linkedIssue,
+                    body: mergeCompleteBody
+                  });
+                }
+                await github.rest.issues.update({
+                  owner, repo, issue_number: linkedIssue,
+                  state: 'closed'
+                });
+                core.info(`Closed linked issue #${linkedIssue}.`);
+              } catch (issueError) {
+                core.warning(`Failed to close linked issue #${linkedIssue}: ${issueError.message}`);
+              }
+            } else {
+              // Fallback: no linked issue found — post enriched comment on the PR itself
+              // Dedup: skip if AGENT_MERGE_COMPLETE already posted on the PR
+              const prComments = await github.rest.issues.listComments({
+                owner, repo, issue_number: prNumber, per_page: 100
+              });
+              if (prComments.data.some(c => typeof c.body === 'string' && c.body.startsWith('<!-- AGENT_MERGE_COMPLETE -->'))) {
+                core.info(`AGENT_MERGE_COMPLETE already posted on PR #${prNumber}. Skipping duplicate.`);
+              } else {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: mergeCompleteBody
+                });
+              }
+              core.warning('No linked issue found in PR body. Posted merge-complete comment on PR as fallback.');
+            }
