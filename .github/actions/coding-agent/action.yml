@@ -1,0 +1,79 @@
+name: DSG Coding Agent
+description: >-
+  Agentic coding loop using DeepSeek (or compatible OpenAI-format API).
+  Reads issue context, follows the approved plan, edits files, and commits locally.
+  Does NOT push or create PRs — the calling workflow handles that.
+
+inputs:
+  api-key:
+    description: API key for the LLM provider (DeepSeek, OpenAI, etc).
+    required: true
+  issue-context:
+    description: Path to the issue context JSON file (.agent/issue-context.json).
+    required: true
+  branch-name:
+    description: Git branch the agent is working on.
+    required: true
+  issue-number:
+    description: GitHub issue number for commit messages.
+    required: true
+  issue-title:
+    description: GitHub issue title for commit messages.
+    required: false
+    default: ""
+  max-turns:
+    description: Maximum number of agentic loop iterations.
+    required: false
+    default: "80"
+  mode:
+    description: "'implement' (default) or 'revise'. Revise mode uses a revision-focused prompt."
+    required: false
+    default: "implement"
+  review-concerns:
+    description: "Review concerns text to address (used in revise mode only)."
+    required: false
+    default: ""
+  model:
+    description: Model identifier (e.g. deepseek-chat, gpt-4o).
+    required: false
+    default: "deepseek-chat"
+  api-base-url:
+    description: Base URL for the OpenAI-compatible API.
+    required: false
+    default: "https://api.deepseek.com"
+
+outputs:
+  outcome:
+    description: "'success' if the agent completed normally, 'failure' if it hit max_turns or errored."
+    value: ${{ steps.agent.outputs.outcome }}
+  turns_used:
+    description: Number of agentic loop turns consumed.
+    value: ${{ steps.agent.outputs.turns_used }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Python dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+        pip install --quiet openai>=1.30.0
+
+    - name: Run coding agent
+      id: agent
+      shell: bash
+      env:
+        AGENT_API_KEY: ${{ inputs.api-key }}
+        AGENT_API_BASE_URL: ${{ inputs.api-base-url }}
+        AGENT_MODEL: ${{ inputs.model }}
+        AGENT_ISSUE_CONTEXT: ${{ inputs.issue-context }}
+        AGENT_BRANCH_NAME: ${{ inputs.branch-name }}
+        AGENT_ISSUE_NUMBER: ${{ inputs.issue-number }}
+        AGENT_ISSUE_TITLE: ${{ inputs.issue-title }}
+        AGENT_MAX_TURNS: ${{ inputs.max-turns }}
+        AGENT_MODE: ${{ inputs.mode }}
+        AGENT_REVIEW_CONCERNS: ${{ inputs.review-concerns }}
+      run: |
+        set -euo pipefail
+        export PYTHONPATH="${{ github.action_path }}"
+        python3 "${{ github.action_path }}/agent.py"
