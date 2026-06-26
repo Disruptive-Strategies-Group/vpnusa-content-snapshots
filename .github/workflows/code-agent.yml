@@ -656,8 +656,16 @@ jobs:
               body: '<!-- AGENT_BLOCKED -->\nAgent finalize run reached an unexpected state.\n\nPlease inspect the workflow and re-run from the issue once corrected.\n\nStatus: AGENT:BLOCKED'
             });
 
+      - name: Check for existing PR on branch
+        id: existing_pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          PR_URL=$(gh pr list --head "${{ env.BRANCH_NAME }}" --json url --jq '.[0].url' 2>/dev/null || echo "")
+          echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
+
       - name: "Finalize: create or retitle PR after NEEDS-REVIEW"
-        if: ${{ needs.route.outputs.mode == 'implement' && needs.implement.result == 'success' && needs.implement.outputs.no_changes != 'true' }}
+        if: ${{ needs.route.outputs.mode == 'implement' && needs.implement.outputs.no_changes != 'true' && steps.existing_pr.outputs.pr_url == '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
