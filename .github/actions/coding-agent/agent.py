@@ -99,6 +99,7 @@ HARD REQUIREMENTS:
 - Do not modify .github/workflows unless the issue explicitly requires it.
 - Do not modify .claude/ directory.
 - Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages.
+- NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
 
 WORKFLOW:
 1. Read the issue and the approved plan carefully.
@@ -128,6 +129,7 @@ HARD REQUIREMENTS:
 - Do not modify .github/workflows unless the review concerns explicitly require it.
 - Do not modify .claude/ directory.
 - Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages.
+- NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
 
 WORKFLOW:
 1. Run `git diff origin/main...HEAD` to understand what this branch has changed.
