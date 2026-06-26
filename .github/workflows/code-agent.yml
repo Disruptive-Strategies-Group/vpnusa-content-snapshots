@@ -129,7 +129,7 @@ jobs:
     needs: [route]
     if: needs.route.outputs.mode == 'implement'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 75
     outputs:
       no_changes: ${{ steps.push.outputs.no_changes }}
       pre_push_branch_sha: ${{ steps.pre_push_sha.outputs.pre_push_branch_sha }}
@@ -246,7 +246,7 @@ jobs:
           branch-name: ${{ env.BRANCH_NAME }}
           issue-number: ${{ env.ISSUE_NUMBER }}
           issue-title: ${{ env.ISSUE_TITLE }}
-          max-turns: "80"
+          max-turns: "100"
 
       - name: Safety net - commit working tree if Claude didn't
         id: autocommit
