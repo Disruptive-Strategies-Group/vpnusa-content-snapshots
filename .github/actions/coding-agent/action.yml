@@ -24,7 +24,7 @@ inputs:
   max-turns:
     description: Maximum number of agentic loop iterations.
     required: false
-    default: "80"
+    default: "100"
   mode:
     description: "'implement' (default) or 'revise'. Revise mode uses a revision-focused prompt."
     required: false
