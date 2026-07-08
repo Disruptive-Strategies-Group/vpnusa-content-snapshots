@@ -32,6 +32,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DSG_AGENTIC_APP_ID }}
+          private-key: ${{ secrets.DSG_AGENTIC_PRIVATE_KEY }}
+
       - name: Check deploy trigger overlay
         if: github.event_name == 'push'
         id: overlay_check
@@ -128,6 +135,12 @@ jobs:
               echo "db_name=fpc_data_lake" >> "$GITHUB_OUTPUT"
               SECRET_ARN="arn:aws:secretsmanager:us-east-2:604860202807:secret:rds!db-c79b93bd-346b-442d-8ea2-01cd14361de4-r3eHNC"
               ;;
+            AERIS_RAG)
+              echo "bastion=i-06f8112c568d8afa4" >> "$GITHUB_OUTPUT"
+              echo "db_host=aeris-rag.c12404wg0jbg.us-east-2.rds.amazonaws.com" >> "$GITHUB_OUTPUT"
+              echo "db_name=aeris_rag" >> "$GITHUB_OUTPUT"
+              SECRET_ARN="aeris-rag-db"
+              ;;
             *)
               echo "ERROR: Unknown client '$CLIENT' in flyway.overlay.json"
               exit 1
@@ -203,7 +216,7 @@ jobs:
         if: always()
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             try {
               const owner = context.repo.owner;
