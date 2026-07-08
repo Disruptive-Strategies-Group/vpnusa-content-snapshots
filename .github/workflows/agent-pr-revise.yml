@@ -26,11 +26,18 @@ jobs:
     timeout-minutes: 45
 
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DSG_AGENTIC_APP_ID }}
+          private-key: ${{ secrets.DSG_AGENTIC_PRIVATE_KEY }}
+
       - name: Parse PR metadata
         id: meta
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = context.payload.pull_request.number;
@@ -48,7 +55,7 @@ jobs:
         id: cycle_guard
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
@@ -76,8 +83,8 @@ jobs:
               // Fetch current PR title and update to 🔴 [AGENT:BLOCKED]
               const prData = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
               const currentTitle = prData.data.title || '';
-              const RED = '\uD83D\uDD34'; // 🔴
-              const cleaned = currentTitle.replace(/^[\uD83D\uDFE1\uD83D\uDD35\uD83D\uDFE2\uD83D\uDD34]?\s*\[AGENT:[^\]]+\]\s*/iu, '').trim();
+              const RED = '🔴'; // 🔴
+              const cleaned = currentTitle.replace(/^[🟡🔵🟢\uD83DĴ]?\s*\[AGENT:[^\]]+\]\s*/iu, '').trim();
               const newTitle = RED + ' [AGENT:BLOCKED] ' + cleaned;
               await github.rest.pulls.update({ owner, repo, pull_number: prNumber, title: newTitle });
 
@@ -100,7 +107,7 @@ jobs:
         id: concerns
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
@@ -162,7 +169,7 @@ jobs:
         if: steps.concerns.outputs.no_concerns == 'true'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
@@ -176,7 +183,7 @@ jobs:
         if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.DSG_BOT_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           ref: ${{ steps.meta.outputs.head_ref }}
           fetch-depth: 0
 
@@ -190,7 +197,7 @@ jobs:
         if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           mkdir -p .agent
@@ -247,7 +254,7 @@ jobs:
           steps.claude.outcome == 'failure'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
@@ -326,7 +333,7 @@ jobs:
               echo "diff_summary=No file changes were made this revision cycle." >> "$GITHUB_OUTPUT"
             else
               echo "${DIFF}" > /tmp/agent_diff.txt
-              {
+               {
                 echo 'diff_summary<<EOF'
                 cat /tmp/agent_diff.txt
                 echo 'EOF'
@@ -343,7 +350,7 @@ jobs:
           CONCERNS: ${{ steps.concerns.outputs.concerns }}
           DIFF_SUMMARY: ${{ steps.actual_diff.outputs.diff_summary }}
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
