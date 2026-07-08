@@ -137,27 +137,37 @@ jobs:
       branch_advanced: ${{ steps.branch_advanced.outputs.branch_advanced }}
       pr_url: ${{ steps.pr.outputs.pr_url }}
     env:
-      GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
       DEFAULT_BRANCH: main
       ISSUE_NUMBER: ${{ needs.route.outputs.issue_number }}
       ISSUE_TITLE: ${{ needs.route.outputs.issue_title }}
       BRANCH_NAME: ${{ needs.route.outputs.branch_name }}
 
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DSG_AGENTIC_APP_ID }}
+          private-key: ${{ secrets.DSG_AGENTIC_PRIVATE_KEY }}
+
+      - name: Export GH_TOKEN to environment
+        shell: bash
+        run: echo "GH_TOKEN=${{ steps.app-token.outputs.token }}" >> $GITHUB_ENV
+
       - name: Preflight secrets
         shell: bash
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
-          DSG_BOT_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+          DSG_AGENTIC_APP_ID: ${{ secrets.DSG_AGENTIC_APP_ID }}
         run: |
           set -euo pipefail
           test -n "${DEEPSEEK_API_KEY}" || (echo "ERROR: DEEPSEEK_API_KEY missing/empty" && exit 1)
-          test -n "${DSG_BOT_TOKEN}" || (echo "ERROR: DSG_BOT_TOKEN missing/empty" && exit 1)
+          test -n "${DSG_AGENTIC_APP_ID}" || (echo "ERROR: DSG_AGENTIC_APP_ID missing/empty" && exit 1)
 
       - name: Set IN-PROGRESS title
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           retries: 3
           retry-exempt-status-codes: 400,401,404,422
           script: |
@@ -187,7 +197,7 @@ jobs:
       - name: Checkout (bot token, full history)
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.DSG_BOT_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
 
       - name: Prepare reusable branch
@@ -228,7 +238,7 @@ jobs:
       - name: Gather issue context
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           mkdir -p .agent
@@ -509,7 +519,7 @@ jobs:
         id: pr
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           pr_url=$(gh pr view --repo "${GITHUB_REPOSITORY}" --head "${BRANCH_NAME}" --json url -q .url 2>/dev/null || true)
@@ -543,6 +553,13 @@ jobs:
       BRANCH_ADVANCED: ${{ needs.implement.outputs.branch_advanced }}
 
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DSG_AGENTIC_APP_ID }}
+          private-key: ${{ secrets.DSG_AGENTIC_PRIVATE_KEY }}
+
       - name: Check for existing BLOCKED comment
         id: check_blocked
         env:
@@ -555,7 +572,7 @@ jobs:
         if: steps.check_blocked.outputs.count == '0'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           retries: 3
           retry-exempt-status-codes: 400,401,404,422
           script: |
@@ -668,7 +685,7 @@ jobs:
         if: ${{ needs.route.outputs.mode == 'implement' && needs.implement.outputs.no_changes != 'true' && steps.existing_pr.outputs.pr_url == '' }}
         shell: bash
         env:
-          GH_TOKEN: ${{ secrets.DSG_BOT_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           issue_title=$(gh issue view "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json title -q .title)
