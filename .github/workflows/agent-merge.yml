@@ -23,11 +23,18 @@ jobs:
     timeout-minutes: 10
 
     steps:
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DSG_AGENTIC_APP_ID }}
+          private-key: ${{ secrets.DSG_AGENTIC_PRIVATE_KEY }}
+
       - name: Parse trigger comment
         id: parse
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const body = context.payload.comment.body;
             const prNumber = context.payload.issue.number;
@@ -50,7 +57,7 @@ jobs:
         id: guard
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.parse.outputs.pr_number }}');
@@ -87,7 +94,7 @@ jobs:
         id: gates
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.parse.outputs.pr_number }}');
@@ -109,7 +116,7 @@ jobs:
         if: steps.guard.outputs.already_merged != 'true'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ secrets.DSG_BOT_TOKEN }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.parse.outputs.pr_number }}');
