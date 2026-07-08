@@ -34,9 +34,9 @@ inputs:
     required: false
     default: ""
   model:
-    description: Model identifier (e.g. deepseek-chat, gpt-4o).
+    description: Model identifier (e.g. deepseek-v4-flash, gpt-4o).
     required: false
-    default: "deepseek-chat"
+    default: "deepseek-v4-flash"
   api-base-url:
     description: Base URL for the OpenAI-compatible API.
     required: false
