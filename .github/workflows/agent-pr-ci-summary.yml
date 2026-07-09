@@ -499,11 +499,19 @@ jobs:
               body
             });
 
+      - name: Generate commenter app token for PR_READY
+        id: commenter-token
+        if: steps.resolve.outputs.skip != 'true' && steps.build.outputs.skip_post != 'true' && steps.build.outputs.all_complete == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DSG_COMMENTER_APP_ID }}
+          private-key: ${{ secrets.DSG_COMMENTER_PRIVATE_KEY }}
+
       - name: Post AGENT_PR_READY comment when checks are terminal
         if: steps.resolve.outputs.skip != 'true' && steps.build.outputs.skip_post != 'true' && steps.build.outputs.all_complete == 'true'
         uses: actions/github-script@v7
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ steps.commenter-token.outputs.token }}
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
