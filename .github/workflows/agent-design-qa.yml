@@ -1,0 +1,285 @@
+# Canonical workflow — distributed to all org repos by dsg-repo-initializer's
+# org-deploy-agent.yml. Do not edit per-repo copies; edit the canon and roll out.
+#
+# Agent Design QA — pre-merge, code-vs-design review.
+#
+# When an agent PR's linked issue carries reference image(s) (screenshots
+# embedded by Aeris), a vision model reviews the PR's changes against the
+# image(s) and the issue's Design Spec. Mismatches are submitted as a
+# CHANGES_REQUESTED review by dsg-commenter[bot], which triggers the existing
+# agent-pr-revise loop (its cycle guard caps rounds at 3, then escalates).
+# PRs whose linked issue has no images pass through instantly.
+#
+# Auth: the OpenRouter key is fetched at runtime from Secrets Manager via
+# the org's standard OIDC deploy role (same pattern as sam-deploy.yml) —
+# no key is duplicated into GitHub secrets.
+#
+# Required org secrets:
+#   AWS_DEPLOY_ROLE_ARN           — existing OIDC deploy role (already set org-wide);
+#                                   the role has scoped GetSecretValue on the
+#                                   aeris-integrations secret
+#   DSG_COMMENTER_APP_ID/_PRIVATE_KEY — review identity (falls back to a plain
+#                                   comment if absent; revise loop won't auto-fire)
+
+name: Agent Design QA
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+  issues: read
+
+concurrency:
+  group: agent-design-qa-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  design-qa:
+    name: design-qa
+    runs-on: ubuntu-latest
+    # Agent branches only — human PRs get human review.
+    if: startsWith(github.event.pull_request.head.ref, 'claude/')
+    timeout-minutes: 15
+
+    steps:
+      - name: Resolve linked issue and reference images
+        id: ctx
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const pr = context.payload.pull_request;
+            const fs = require('fs');
+
+            // Linked issue: "Closes #N" in PR body, else branch claude/issue-N
+            let issueNumber = null;
+            const body = pr.body || '';
+            const m = body.match(/(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#(\d+)/i);
+            if (m) issueNumber = Number(m[1]);
+            if (!issueNumber) {
+              const bm = pr.head.ref.match(/issue-(\d+)/);
+              if (bm) issueNumber = Number(bm[1]);
+            }
+            if (!issueNumber) {
+              core.setOutput('skip', 'true');
+              core.info('No linked issue found — design QA not applicable.');
+              return;
+            }
+
+            const issue = await github.rest.issues.get({ owner, repo, issue_number: issueNumber });
+            const ibody = issue.data.body || '';
+            const imgs = [...ibody.matchAll(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/g)].map(x => x[1]);
+            const unique = [...new Set(imgs)].slice(0, 3);
+            if (unique.length === 0) {
+              core.setOutput('skip', 'true');
+              core.info(`Issue #${issueNumber} has no reference images — design QA not applicable.`);
+              return;
+            }
+
+            fs.mkdirSync('.design-qa', { recursive: true });
+            fs.writeFileSync('.design-qa/issue-body.md', ibody);
+            fs.writeFileSync('.design-qa/images.json', JSON.stringify(unique));
+            core.setOutput('skip', 'false');
+            core.setOutput('issue_number', String(issueNumber));
+            core.info(`Design QA applicable: issue #${issueNumber}, ${unique.length} reference image(s).`);
+
+      - name: Configure AWS credentials (OIDC)
+        id: aws
+        if: steps.ctx.outputs.skip != 'true'
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - name: Fetch OpenRouter key from Secrets Manager
+        id: creds
+        if: steps.ctx.outputs.skip != 'true'
+        run: |
+          if [ "${{ steps.aws.outcome }}" != "success" ]; then
+            echo "WARNING: OIDC role assumption failed — design QA cannot run. Passing through."
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          KEY=$(aws secretsmanager get-secret-value \
+            --secret-id "arn:aws:secretsmanager:us-east-2:193527004156:secret:aeris-integrations-H8lBNN" \
+            --query SecretString --output text 2>/dev/null | jq -r '.openrouter_api_key // empty')
+          if [ -z "${KEY}" ]; then
+            echo "WARNING: openrouter_api_key not readable from Secrets Manager — passing through."
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::add-mask::${KEY}"
+          echo "OPENROUTER_API_KEY=${KEY}" >> "$GITHUB_ENV"
+          echo "have_key=true" >> "$GITHUB_OUTPUT"
+
+      - name: Collect PR changes
+        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = context.payload.pull_request.number;
+            const fs = require('fs');
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: prNumber, per_page: 100
+            });
+
+            const PER_FILE_CAP = 14000;
+            const TOTAL_CAP = 110000;
+            let doc = '';
+            let dropped = 0;
+            for (const f of files) {
+              let patch = f.patch || '(binary or too-large diff omitted by GitHub)';
+              if (patch.length > PER_FILE_CAP) {
+                patch = patch.slice(0, PER_FILE_CAP) + '\n[patch truncated]';
+              }
+              const entry = `\n===== FILE: ${f.filename} (${f.status}, +${f.additions}/-${f.deletions}) =====\n${patch}\n`;
+              if (doc.length + entry.length > TOTAL_CAP) { dropped++; continue; }
+              doc += entry;
+            }
+            if (dropped > 0) doc += `\n[${dropped} additional file(s) omitted for size]\n`;
+            fs.writeFileSync('.design-qa/changes.diff', doc);
+            core.info(`Collected ${files.length} changed file(s), ${doc.length} chars (${dropped} dropped).`);
+
+      - name: Run vision design review
+        id: review
+        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true'
+        env:
+          # OPENROUTER_API_KEY comes from GITHUB_ENV (set by the creds step)
+          DESIGN_QA_MODEL: ${{ vars.DESIGN_QA_MODEL || 'z-ai/glm-5v-turbo' }}
+        run: |
+          pip install --quiet requests
+          python3 - << 'PYEOF'
+          import json, os, re, sys
+          import requests
+
+          issue_body = open('.design-qa/issue-body.md', encoding='utf-8').read()
+          images = json.load(open('.design-qa/images.json'))
+          changes = open('.design-qa/changes.diff', encoding='utf-8').read()
+
+          prompt = (
+              "You are a design QA reviewer for an automated coding pipeline. "
+              "You can SEE the reference design image(s) attached. The issue "
+              "below (including any Design Spec section) describes the intended "
+              "design; the diff shows what an autonomous coding agent changed.\n\n"
+              "Judge whether the implementation plausibly reproduces the "
+              "reference design. Report ONLY material mismatches, e.g.:\n"
+              "- components built that do NOT exist in the reference design "
+              "(invented headers, bars, sections)\n"
+              "- components in the design that are missing from the implementation\n"
+              "- accent/brand colors applied to elements that do not carry them "
+              "in the design\n"
+              "- wrong typography family (serif vs sans-serif) on prominent text\n"
+              "- layout structure contradicting the design (column counts, "
+              "card anatomy, element placement)\n"
+              "Do NOT nitpick pixel values, minor spacing, or anything not "
+              "visible in the reference. If the diff only touches non-visual "
+              "code, pass it.\n\n"
+              "Respond ONLY with JSON: {\"pass\": true|false, "
+              "\"summary\": \"one sentence\", \"mismatches\": [\"...\"]}\n\n"
+              f"===== ISSUE =====\n{issue_body[:20000]}\n\n"
+              f"===== DIFF =====\n{changes}"
+          )
+
+          content = [{"type": "text", "text": prompt}]
+          for url in images:
+              content.append({"type": "image_url", "image_url": {"url": url}})
+
+          resp = requests.post(
+              "https://openrouter.ai/api/v1/chat/completions",
+              headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+              json={
+                  "model": os.environ.get("DESIGN_QA_MODEL", "z-ai/glm-5v-turbo"),
+                  "messages": [{"role": "user", "content": content}],
+                  "max_tokens": 1500,
+              },
+              timeout=120,
+          )
+          resp.raise_for_status()
+          raw = resp.json()["choices"][0]["message"]["content"].strip()
+          if raw.startswith("```"):
+              raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+          try:
+              verdict = json.loads(raw)
+          except json.JSONDecodeError:
+              m = re.search(r"\{.*\}", raw, re.DOTALL)
+              verdict = json.loads(m.group(0)) if m else {"pass": True, "summary": "Unparseable review output — passing through.", "mismatches": []}
+
+          json.dump(verdict, open('.design-qa/verdict.json', 'w'))
+          out = os.environ.get("GITHUB_OUTPUT")
+          with open(out, "a") as f:
+              f.write(f"pass={'true' if verdict.get('pass') else 'false'}\n")
+          print("VERDICT:", json.dumps(verdict, indent=2))
+          PYEOF
+
+      - name: Post pass comment
+        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true' && steps.review.outputs.pass == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            const verdict = JSON.parse(fs.readFileSync('.design-qa/verdict.json', 'utf-8'));
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `<!-- AGENT_DESIGN_QA --> ✅ **Design QA passed**\n\n${verdict.summary || ''}`
+            });
+
+      - name: Generate commenter app token
+        id: commenter-token
+        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true' && steps.review.outputs.pass == 'false'
+        continue-on-error: true
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.DSG_COMMENTER_APP_ID }}
+          private-key: ${{ secrets.DSG_COMMENTER_PRIVATE_KEY }}
+
+      - name: Request changes with mismatches
+        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true' && steps.review.outputs.pass == 'false'
+        uses: actions/github-script@v7
+        with:
+          # Review must come from dsg-commenter[bot]: it is allow-listed in
+          # agent-pr-revise, it is not the PR author, and app-token events
+          # trigger workflows (GITHUB_TOKEN events do not).
+          github-token: ${{ steps.commenter-token.outputs.token || github.token }}
+          script: |
+            const fs = require('fs');
+            const verdict = JSON.parse(fs.readFileSync('.design-qa/verdict.json', 'utf-8'));
+            const mismatches = (verdict.mismatches || []).map(m => `- ${m}`).join('\n');
+            const body =
+              `<!-- AGENT_DESIGN_QA --> ⚠️ **Design QA found mismatches with the reference design**\n\n` +
+              `${verdict.summary || ''}\n\n` +
+              `Address each of the following against the reference image(s) and Design Spec in the linked issue:\n\n` +
+              `${mismatches}\n\n` +
+              `Do not change anything not listed above.`;
+            const usingAppToken = '${{ steps.commenter-token.outputs.token }}' !== '';
+            if (usingAppToken) {
+              await github.rest.pulls.createReview({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: context.payload.pull_request.number,
+                event: 'REQUEST_CHANGES',
+                body
+              });
+              core.info('Submitted CHANGES_REQUESTED review — agent-pr-revise will pick it up.');
+            } else {
+              // Fallback: commenter app secrets unavailable — leave a visible
+              // comment (the revise loop will NOT auto-fire from GITHUB_TOKEN).
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: body + '\n\n_(commenter app unavailable — auto-revise not triggered)_'
+              });
+              core.warning('DSG_COMMENTER app secrets unavailable; posted comment instead of review.');
+            }
