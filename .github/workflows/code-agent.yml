@@ -333,7 +333,8 @@ jobs:
           changed=0
 
           for f in ci.yml code-agent.yml issue-deploy-lifecycle.yml lifecycle-bootstrap.yml agent-pr-ci-summary.yml \
-                    agent-merge.yml agent-pr-claude-verdict.yml agent-pr-review.yml agent-pr-revise.yml; do
+                    agent-merge.yml agent-pr-claude-verdict.yml agent-pr-review.yml agent-pr-revise.yml \
+                    agent-design-qa.yml; do
             fp=".github/workflows/${f}"
             # Only sync if branch hasn't intentionally modified this file vs merge-base
             if git diff --quiet "${merge_base}" HEAD -- "${fp}" 2>/dev/null; then
