@@ -279,7 +279,7 @@ jobs:
           set -euo pipefail
 
           # Never allow agent to modify canonical control files — leave repo-specific workflows untouched
-          for f in ci.yml code-agent.yml issue-deploy-lifecycle.yml lifecycle-bootstrap.yml agent-pr-ci-summary.yml agent-pr-revise.yml agent-pr-review.yml agent-pr-claude-verdict.yml agent-merge.yml; do
+          for f in ci.yml code-agent.yml issue-deploy-lifecycle.yml lifecycle-bootstrap.yml agent-pr-ci-summary.yml agent-pr-revise.yml agent-pr-review.yml agent-pr-claude-verdict.yml agent-merge.yml agent-design-qa.yml; do
             git restore --staged --worktree ".github/workflows/${f}" 2>/dev/null || true
           done
           rm -rf .agent .claude-pr
