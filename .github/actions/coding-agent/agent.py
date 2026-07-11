@@ -73,13 +73,20 @@ def extract_latest_plan(issue_data: dict) -> str | None:
 
 
 def build_issue_summary(issue_data: dict) -> str:
-    """Build a concise issue summary for the system prompt."""
+    """Build a concise issue summary for the system prompt.
+
+    Cap raised 8,000 -> 32,000 chars: Aeris now files issues carrying an
+    auto-generated design spec plus attachment links, and the old cap
+    silently truncated exactly the spec the agent needed to implement
+    faithfully. 32k chars (~8k tokens) persists in the system prompt every
+    turn, which still leaves ample model context for tool outputs; going
+    much higher would start squeezing the agent's working context instead.
+    """
     title = issue_data.get("title", "")
     body = issue_data.get("body", "")
 
-    # Truncate very long bodies
-    if len(body) > 8000:
-        body = body[:8000] + "\n\n... [truncated]"
+    if len(body) > 32000:
+        body = body[:32000] + "\n\n... [truncated]"
 
     return f"## Issue Title\n{title}\n\n## Issue Body\n{body}"
 
