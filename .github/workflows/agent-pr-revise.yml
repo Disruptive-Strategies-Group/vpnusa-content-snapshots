@@ -220,7 +220,7 @@ jobs:
                 return 0
               }
               local rc=$?
-              if echo "$output" | grep -qi "secondary rate limit\|rate limit" && [ $attempt -le $max_retries ]; then
+              if echo "$output" | grep -qi "secondary rate limit\|rate limit\|Something went wrong\|GraphQL:\|Internal Server Error\|502 Bad Gateway\|503 Service Unavailable\|504 Gateway Timeout\|connection reset\|EOF" && [ $attempt -le $max_retries ]; then
                 local wait=$((attempt * 30))
                 echo "GitHub rate limit hit on attempt $attempt. Waiting ${wait}s before retry..."
                 sleep $wait
