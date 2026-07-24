@@ -241,8 +241,31 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
+
+          gh_with_retry() {
+            local max_retries=3
+            local attempt=0
+            while [ $attempt -le $max_retries ]; do
+              attempt=$((attempt + 1))
+              local output
+              output=$(gh "$@" 2>&1) && {
+                echo "$output"
+                return 0
+              }
+              local rc=$?
+              if echo "$output" | grep -qi "secondary rate limit\|rate limit" && [ $attempt -le $max_retries ]; then
+                local wait=$((attempt * 30))
+                echo "GitHub rate limit hit on attempt $attempt. Waiting ${wait}s before retry..."
+                sleep $wait
+                continue
+              fi
+              echo "$output" >&2
+              return $rc
+            done
+          }
+
           mkdir -p .agent
-          gh issue view "${ISSUE_NUMBER}" \
+          gh_with_retry issue view "${ISSUE_NUMBER}" \
             --repo "${GITHUB_REPOSITORY}" \
             --json title,body,comments \
             > .agent/issue-context.json
@@ -523,7 +546,30 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          pr_url=$(gh pr view --repo "${GITHUB_REPOSITORY}" --head "${BRANCH_NAME}" --json url -q .url 2>/dev/null || true)
+
+          gh_with_retry() {
+            local max_retries=3
+            local attempt=0
+            while [ $attempt -le $max_retries ]; do
+              attempt=$((attempt + 1))
+              local output
+              output=$(gh "$@" 2>&1) && {
+                echo "$output"
+                return 0
+              }
+              local rc=$?
+              if echo "$output" | grep -qi "secondary rate limit\|rate limit" && [ $attempt -le $max_retries ]; then
+                local wait=$((attempt * 30))
+                echo "GitHub rate limit hit on attempt $attempt. Waiting ${wait}s before retry..."
+                sleep $wait
+                continue
+              fi
+              echo "$output" >&2
+              return $rc
+            done
+          }
+
+          pr_url=$(gh_with_retry pr view --repo "${GITHUB_REPOSITORY}" --head "${BRANCH_NAME}" --json url -q .url 2>/dev/null || true)
           echo "pr_url=${pr_url}" >> "$GITHUB_OUTPUT"
           if [ -n "${pr_url}" ]; then
             echo "Existing PR hint from implement job: ${pr_url}"
@@ -566,7 +612,28 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          EXISTING=$(gh issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json comments --jq '[.comments[].body | select(startswith("<!-- AGENT_BLOCKED -->"))] | length')
+          gh_with_retry() {
+            local max_retries=3
+            local attempt=0
+            while [ $attempt -le $max_retries ]; do
+              attempt=$((attempt + 1))
+              local output
+              output=$(gh "$@" 2>&1) && {
+                echo "$output"
+                return 0
+              }
+              local rc=$?
+              if echo "$output" | grep -qi "secondary rate limit\|rate limit" && [ $attempt -le $max_retries ]; then
+                local wait=$((attempt * 30))
+                echo "GitHub rate limit hit on attempt $attempt. Waiting ${wait}s before retry..."
+                sleep $wait
+                continue
+              fi
+              echo "$output" >&2
+              return $rc
+            done
+          }
+          EXISTING=$(gh_with_retry issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json comments --jq '[.comments[].body | select(startswith("<!-- AGENT_BLOCKED -->"))] | length')
           echo "count=$EXISTING" >> "$GITHUB_OUTPUT"
 
       - name: "Finalize: update title prefix + comment"
@@ -679,7 +746,28 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          PR_URL=$(gh pr list --head "${{ env.BRANCH_NAME }}" --json url --jq '.[0].url' 2>/dev/null || echo "")
+          gh_with_retry() {
+            local max_retries=3
+            local attempt=0
+            while [ $attempt -le $max_retries ]; do
+              attempt=$((attempt + 1))
+              local output
+              output=$(gh "$@" 2>&1) && {
+                echo "$output"
+                return 0
+              }
+              local rc=$?
+              if echo "$output" | grep -qi "secondary rate limit\|rate limit" && [ $attempt -le $max_retries ]; then
+                local wait=$((attempt * 30))
+                echo "GitHub rate limit hit on attempt $attempt. Waiting ${wait}s before retry..."
+                sleep $wait
+                continue
+              fi
+              echo "$output" >&2
+              return $rc
+            done
+          }
+          PR_URL=$(gh_with_retry pr list --head "${{ env.BRANCH_NAME }}" --json url --jq '.[0].url' 2>/dev/null || echo "")
           echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
 
       - name: "Finalize: create or retitle PR after NEEDS-REVIEW"
@@ -689,7 +777,30 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
-          issue_title=$(gh issue view "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json title -q .title)
+
+          gh_with_retry() {
+            local max_retries=3
+            local attempt=0
+            while [ $attempt -le $max_retries ]; do
+              attempt=$((attempt + 1))
+              local output
+              output=$(gh "$@" 2>&1) && {
+                echo "$output"
+                return 0
+              }
+              local rc=$?
+              if echo "$output" | grep -qi "secondary rate limit\|rate limit" && [ $attempt -le $max_retries ]; then
+                local wait=$((attempt * 30))
+                echo "GitHub rate limit hit on attempt $attempt. Waiting ${wait}s before retry..."
+                sleep $wait
+                continue
+              fi
+              echo "$output" >&2
+              return $rc
+            done
+          }
+
+          issue_title=$(gh_with_retry issue view "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json title -q .title)
           pr_body=$(cat <<EOF
           Closes #${ISSUE_NUMBER}
 
@@ -701,7 +812,7 @@ jobs:
           # Finalize is authoritative for PR existence.
           # Prefer implement output if present, but always re-resolve defensively before create.
           if [ -z "${pr_url}" ]; then
-            pr_url=$(gh pr list \
+            pr_url=$(gh_with_retry pr list \
               --repo "${GITHUB_REPOSITORY}" \
               --state open \
               --head "${BRANCH_NAME}" \
@@ -712,12 +823,12 @@ jobs:
 
           if [ -n "${pr_url}" ]; then
             pr_number="${pr_url##*/}"
-            gh pr edit "${pr_number}" \
+            gh_with_retry pr edit "${pr_number}" \
               --repo "${GITHUB_REPOSITORY}" \
               --title "Agent: ${issue_title} (#${ISSUE_NUMBER})" \
               --body "${pr_body}"
           else
-            pr_url=$(gh pr create \
+            pr_url=$(gh_with_retry pr create \
               --repo "${GITHUB_REPOSITORY}" \
               --base "${DEFAULT_BRANCH}" \
               --head "${BRANCH_NAME}" \
