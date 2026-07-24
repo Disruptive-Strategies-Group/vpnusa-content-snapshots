@@ -38,6 +38,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const { owner, repo } = context.repo;
             const prNumber = context.payload.pull_request.number;
@@ -56,6 +58,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
@@ -108,6 +112,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
@@ -170,6 +176,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
@@ -200,10 +208,33 @@ jobs:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
+
+          gh_with_retry() {
+            local max_retries=3
+            local attempt=0
+            while [ $attempt -le $max_retries ]; do
+              attempt=$((attempt + 1))
+              local output
+              output=$(gh "$@" 2>&1) && {
+                echo "$output"
+                return 0
+              }
+              local rc=$?
+              if echo "$output" | grep -qi "secondary rate limit\|rate limit" && [ $attempt -le $max_retries ]; then
+                local wait=$((attempt * 30))
+                echo "GitHub rate limit hit on attempt $attempt. Waiting ${wait}s before retry..."
+                sleep $wait
+                continue
+              fi
+              echo "$output" >&2
+              return $rc
+            done
+          }
+
           mkdir -p .agent
 
           # Parse PR body for "Closes #N" or "Fixes #N"
-          PR_BODY="$(gh pr view "${{ steps.meta.outputs.pr_number }}" \
+          PR_BODY="$(gh_with_retry pr view "${{ steps.meta.outputs.pr_number }}" \
             --repo "${GITHUB_REPOSITORY}" \
             --json body --jq '.body')"
 
@@ -214,7 +245,7 @@ jobs:
           # cause `gh issue view 0` to fail with a GraphQL error and exit 1.
           if [ -n "${LINKED_ISSUE}" ] && [ "${LINKED_ISSUE}" != "0" ]; then
             echo "Linked issue: #${LINKED_ISSUE}"
-            gh issue view "${LINKED_ISSUE}" \
+            gh_with_retry issue view "${LINKED_ISSUE}" \
               --repo "${GITHUB_REPOSITORY}" \
               --json title,body,comments \
               > .agent/issue-context.json
@@ -255,6 +286,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
@@ -351,6 +384,8 @@ jobs:
           DIFF_SUMMARY: ${{ steps.actual_diff.outputs.diff_summary }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const { owner, repo } = context.repo;
             const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
