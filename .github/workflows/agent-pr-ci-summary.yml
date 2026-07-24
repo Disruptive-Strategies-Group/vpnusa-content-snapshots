@@ -33,6 +33,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const eventName = context.eventName;
             const payload = context.payload;
@@ -118,6 +120,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -485,6 +489,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -512,6 +518,8 @@ jobs:
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.commenter-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
           script: |
             const owner = context.repo.owner;
             const repo = context.repo.repo;
