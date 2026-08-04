@@ -164,7 +164,30 @@ jobs:
           test -n "${DEEPSEEK_API_KEY}" || (echo "ERROR: DEEPSEEK_API_KEY missing/empty" && exit 1)
           test -n "${DSG_AGENTIC_APP_ID}" || (echo "ERROR: DSG_AGENTIC_APP_ID missing/empty" && exit 1)
 
+      - name: Read lifecycle settings
+        id: lifecycle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Read repo-level lifecycle-settings.json; default to enabled (true) when missing or malformed.
+          LIFECYCLE_TITLES_ENABLED="true"
+          content="$(gh api "repos/${GITHUB_REPOSITORY}/contents/lifecycle-settings.json?ref=${DEFAULT_BRANCH}" --jq '.content' 2>/dev/null || true)"
+          if [ -n "${content}" ] && [ "${content}" != "null" ]; then
+            decoded="$(printf '%s' "${content}" | base64 -d 2>/dev/null || true)"
+            parsed="$(printf '%s' "${decoded}" | jq -r '.lifecycleTitlesEnabled // true' 2>/dev/null || true)"
+            if [ -n "${parsed}" ]; then
+              LIFECYCLE_TITLES_ENABLED="${parsed}"
+            else
+              echo "WARN: lifecycle-settings.json is malformed; falling back to lifecycleTitlesEnabled=true"
+            fi
+          fi
+          echo "LIFECYCLE_TITLES_ENABLED=${LIFECYCLE_TITLES_ENABLED}" >> "$GITHUB_OUTPUT"
+          echo "lifecycleTitlesEnabled=${LIFECYCLE_TITLES_ENABLED}"
+
       - name: Set IN-PROGRESS title
+        if: steps.lifecycle.outputs.LIFECYCLE_TITLES_ENABLED == 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
@@ -636,8 +659,30 @@ jobs:
           EXISTING=$(gh_with_retry issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json comments --jq '[.comments[].body | select(startswith("<!-- AGENT_BLOCKED -->"))] | length')
           echo "count=$EXISTING" >> "$GITHUB_OUTPUT"
 
+      - name: Read lifecycle settings
+        id: lifecycle
+        shell: bash
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Read repo-level lifecycle-settings.json; default to enabled (true) when missing or malformed.
+          LIFECYCLE_TITLES_ENABLED="true"
+          content="$(gh api "repos/${GITHUB_REPOSITORY}/contents/lifecycle-settings.json?ref=${DEFAULT_BRANCH}" --jq '.content' 2>/dev/null || true)"
+          if [ -n "${content}" ] && [ "${content}" != "null" ]; then
+            decoded="$(printf '%s' "${content}" | base64 -d 2>/dev/null || true)"
+            parsed="$(printf '%s' "${decoded}" | jq -r '.lifecycleTitlesEnabled // true' 2>/dev/null || true)"
+            if [ -n "${parsed}" ]; then
+              LIFECYCLE_TITLES_ENABLED="${parsed}"
+            else
+              echo "WARN: lifecycle-settings.json is malformed; falling back to lifecycleTitlesEnabled=true"
+            fi
+          fi
+          echo "LIFECYCLE_TITLES_ENABLED=${LIFECYCLE_TITLES_ENABLED}" >> "$GITHUB_OUTPUT"
+          echo "lifecycleTitlesEnabled=${LIFECYCLE_TITLES_ENABLED}"
+
       - name: "Finalize: update title prefix + comment"
-        if: steps.check_blocked.outputs.count == '0'
+        if: steps.check_blocked.outputs.count == '0' && steps.lifecycle.outputs.LIFECYCLE_TITLES_ENABLED == 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
