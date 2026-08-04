@@ -33,6 +33,13 @@ inputs:
     description: "Review concerns text to address (used in revise mode only)."
     required: false
     default: ""
+  required-files:
+    description: >-
+      JSON-encoded array of file paths the agent must restrict its changes to
+      (used by the PR revise workflow to keep revisions on-target). Default '*'
+      means no restriction.
+    required: false
+    default: "*"
   model:
     description: Model identifier (e.g. deepseek-v4-flash, gpt-4o).
     required: false
@@ -73,6 +80,7 @@ runs:
         AGENT_MAX_TURNS: ${{ inputs.max-turns }}
         AGENT_MODE: ${{ inputs.mode }}
         AGENT_REVIEW_CONCERNS: ${{ inputs.review-concerns }}
+        AGENT_REQUIRED_FILES: ${{ inputs.required-files }}
       run: |
         set -euo pipefail
         export PYTHONPATH="${{ github.action_path }}"
