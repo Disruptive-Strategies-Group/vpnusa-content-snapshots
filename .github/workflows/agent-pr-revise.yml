@@ -53,7 +53,29 @@ jobs:
             core.setOutput('head_sha', headSha);
             core.info(`PR #${prNumber}: ${headRef} → ${baseRef} @ ${headSha}`);
 
+      - name: Check blocked:non-substantive label
+        id: blocked_check
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+
+            const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              owner, repo, issue_number: prNumber, per_page: 100
+            });
+            const blocked = labels.some(l => (l.name || '') === 'blocked:non-substantive');
+            core.setOutput('blocked', String(blocked));
+            core.info(`blocked:non-substantive label present: ${blocked}`);
+            if (blocked) {
+              core.warning('PR is blocked — further automatic revision cycles are paused until an admin removes the label.');
+            }
+
       - name: Revision cycle guard
+        if: steps.blocked_check.outputs.blocked != 'true'
         id: cycle_guard
         uses: actions/github-script@v7
         with:
@@ -101,13 +123,18 @@ jobs:
               core.setOutput('escalate', 'false');
             }
 
-      - name: Exit if escalating
-        if: steps.cycle_guard.outputs.escalate == 'true'
+      - name: Exit if escalating or blocked
+        if: steps.cycle_guard.outputs.escalate == 'true' || steps.blocked_check.outputs.blocked == 'true'
         run: |
-          echo "Max revision cycles reached — escalating to human. Exiting."
+          if [ "${{ steps.cycle_guard.outputs.escalate }}" = "true" ]; then
+            echo "Max revision cycles reached — escalating to human. Exiting."
+          else
+            echo "PR is blocked by 'blocked:non-substantive' label — manual intervention required. Exiting."
+          fi
           exit 0
 
       - name: Fetch review concerns
+        if: steps.blocked_check.outputs.blocked != 'true'
         id: concerns
         uses: actions/github-script@v7
         with:
@@ -172,7 +199,7 @@ jobs:
             core.info(`Concerns aggregated from ${concernReviews.length} review(s) (${concerns.length} chars)`);
 
       - name: Exit if no actionable concerns
-        if: steps.concerns.outputs.no_concerns == 'true'
+        if: steps.blocked_check.outputs.blocked != 'true' && steps.concerns.outputs.no_concerns == 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ steps.app-token.outputs.token }}
@@ -187,8 +214,69 @@ jobs:
             });
             core.info('No concerns — exiting early.');
 
+      - name: Parse Gate 1 feedback for flagged file paths
+        id: feedback_parse
+        if: >
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true'
+        shell: bash
+        env:
+          CONCERNS: ${{ steps.concerns.outputs.concerns }}
+        run: |
+          set -euo pipefail
+
+          CONCERNS="${CONCERNS:-}"
+
+          # Extract file paths mentioned in the Gate 1 CHANGES_REQUESTED feedback
+          # using the approved regex:
+          #   \b[\w./-]+\.(liquid|yml|yaml|js|css)\b
+          # Note: -P (PCRE) is used because GNU grep's ERE mode mishandles \w
+          # inside a bracket expression; ubuntu-latest runners ship PCRE-enabled grep.
+          FILES="$(printf '%s\n' "${CONCERNS}" | grep -oP '\b[\w./-]+\.(liquid|yml|yaml|js|css)\b' | sort -u || true)"
+
+          if [ -z "${FILES}" ]; then
+            echo "no_files=true" >> "$GITHUB_OUTPUT"
+            echo "required_files=[]" >> "$GITHUB_OUTPUT"
+            echo "No flagged file paths found in Gate 1 feedback."
+          else
+            echo "no_files=false" >> "$GITHUB_OUTPUT"
+            REQUIRED_JSON="$(printf '%s\n' "${FILES}" | jq -R -s -c 'split("\n") | map(select(length > 0))')"
+            echo "required_files=${REQUIRED_JSON}" >> "$GITHUB_OUTPUT"
+            echo "Flagged file paths extracted from Gate 1 feedback:"
+            printf '%s\n' "${FILES}"
+          fi
+
+      - name: Exit if no flagged file paths
+        if: >
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: [
+                '<!-- AGENT_REVISE_MANUAL_REVIEW -->',
+                '⚠️ **Manual review required** — Gate 1 feedback did not mention any file paths',
+                '(`.liquid`, `.yml`, `.yaml`, `.js`, `.css`), so the revision cannot be validated automatically.',
+                '',
+                'A human reviewer must clarify the requested files or proceed manually.'
+              ].join('\n')
+            });
+            core.info('No flagged file paths found — exiting early.');
+
       - name: Checkout PR branch
-        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
         uses: actions/checkout@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -196,13 +284,21 @@ jobs:
           fetch-depth: 0
 
       - name: Configure git identity
-        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
         run: |
           git config user.name  "dsg-bot"
           git config user.email "dsg-bot@users.noreply.github.com"
 
       - name: Gather linked issue context
-        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
@@ -255,7 +351,11 @@ jobs:
           fi
 
       - name: Capture pre-push SHA
-        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
         id: pre_push_sha
         shell: bash
         run: |
@@ -265,7 +365,11 @@ jobs:
           echo "Pre-push SHA: ${sha}"
 
       - name: Revision agent
-        if: steps.cycle_guard.outputs.escalate != 'true' && steps.concerns.outputs.no_concerns != 'true'
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
         id: claude
         continue-on-error: true
         uses: ./.github/actions/coding-agent
@@ -277,11 +381,14 @@ jobs:
           max-turns: "25"
           mode: revise
           review-concerns: ${{ steps.concerns.outputs.concerns }}
+          required-files: ${{ steps.feedback_parse.outputs.required_files }}
 
       - name: Warn if Claude Code failed
         if: >
           steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true' &&
           steps.claude.outcome == 'failure'
         uses: actions/github-script@v7
         with:
@@ -306,7 +413,9 @@ jobs:
       - name: Safety-net commit and cleanup
         if: >
           steps.cycle_guard.outputs.escalate != 'true' &&
-          steps.concerns.outputs.no_concerns != 'true'
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -340,7 +449,9 @@ jobs:
       - name: Push branch
         if: >
           steps.cycle_guard.outputs.escalate != 'true' &&
-          steps.concerns.outputs.no_concerns != 'true'
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -349,7 +460,9 @@ jobs:
       - name: Capture post-revision diff
         if: >
           steps.cycle_guard.outputs.escalate != 'true' &&
-          steps.concerns.outputs.no_concerns != 'true'
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
         id: actual_diff
         shell: bash
         run: |
@@ -374,10 +487,160 @@ jobs:
             fi
           fi
 
+      - name: Verify revision addresses flagged files
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.claude.outcome == 'success'
+        id: substantive
+        shell: bash
+        env:
+          REQUIRED_FILES: ${{ steps.feedback_parse.outputs.required_files }}
+          PRE_SHA: ${{ steps.pre_push_sha.outputs.pre_push_sha }}
+        run: |
+          set -euo pipefail
+
+          PRE_SHA="${PRE_SHA:-}"
+          if [ -n "${PRE_SHA}" ]; then
+            CHANGED="$(git diff --name-only "${PRE_SHA}"..HEAD || true)"
+          else
+            CHANGED="$(git diff --name-only HEAD~1 || true)"
+          fi
+
+          echo "Changed files in this revision:"
+          printf '%s\n' "${CHANGED}"
+
+          TOUCHED=false
+          REQUIRED_FILES="${REQUIRED_FILES:-}"
+          if [ -n "${REQUIRED_FILES}" ] && [ "${REQUIRED_FILES}" != "[]" ]; then
+            while IFS= read -r req; do
+              [ -z "${req}" ] && continue
+              if printf '%s\n' "${CHANGED}" | grep -qxF -- "${req}"; then
+                TOUCHED=true
+                break
+              fi
+            done <<EOF
+          $(printf '%s' "${REQUIRED_FILES}" | jq -r '.[]')
+          EOF
+          fi
+
+          if [ "${TOUCHED}" = "true" ]; then
+            echo "non_substantive=false" >> "$GITHUB_OUTPUT"
+            echo "Revision is substantive — at least one flagged file was modified."
+          else
+            echo "non_substantive=true" >> "$GITHUB_OUTPUT"
+            echo "Revision is NON-SUBSTANTIVE — no flagged files were modified."
+          fi
+
+      - name: Block PR — non-substantive revision
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.substantive.outputs.non_substantive == 'true'
+        uses: actions/github-script@v7
+        env:
+          REQUIRED_FILES: ${{ steps.feedback_parse.outputs.required_files }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+            let requiredFiles = [];
+            try {
+              requiredFiles = JSON.parse(process.env.REQUIRED_FILES || '[]');
+            } catch (e) {
+              core.warning(`Could not parse REQUIRED_FILES: ${e.message}`);
+            }
+
+            // Apply the blocking label so future CHANGES_REQUESTED runs exit early.
+            try {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber,
+                labels: ['blocked:non-substantive']
+              });
+            } catch (e) {
+              core.warning(`Could not add blocked:non-substantive label: ${e.message}`);
+            }
+
+            const fileList = requiredFiles.length
+              ? requiredFiles.map(f => `- \`${f}\``).join('\n')
+              : '- (none extracted)';
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: [
+                '<!-- AGENT_REVISE_NON_SUBSTANTIVE -->',
+                '🚫 **This revision does not address the requested file changes.**',
+                '',
+                'Gate 1 feedback requested changes to:',
+                fileList,
+                '',
+                'The agent\'s commits did not modify any of those files, so this revision cycle',
+                'was **not counted** against the revision quota.',
+                '',
+                'The PR has been labelled `blocked:non-substantive`. An admin must remove the',
+                'label before further automatic revision cycles can run.'
+              ].join('\n')
+            });
+
+      - name: Increment revision cycle label
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.substantive.outputs.non_substantive == 'false'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+
+            const labels = await github.paginate(github.rest.issues.listLabelsOnIssue, {
+              owner, repo, issue_number: prNumber, per_page: 100
+            });
+            const CYCLE_RE = /^revision-cycle:(\d+)$/;
+            const current = labels
+              .map(l => (l.name || '').match(CYCLE_RE))
+              .filter(Boolean)
+              .map(m => parseInt(m[1], 10))
+              .sort((a, b) => b - a)[0] || 0;
+
+            const next = current + 1;
+            const nextLabel = `revision-cycle:${next}`;
+
+            // Remove any existing revision-cycle labels, then apply the incremented one.
+            for (const l of labels) {
+              if (CYCLE_RE.test(l.name || '')) {
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number: prNumber, name: l.name });
+                } catch (e) {
+                  core.warning(`Could not remove label ${l.name}: ${e.message}`);
+                }
+              }
+            }
+            await github.rest.issues.addLabels({
+              owner, repo, issue_number: prNumber,
+              labels: [nextLabel]
+            });
+            core.info(`Incremented revision cycle label to ${nextLabel}`);
+
       - name: Post revision summary comment
         if: >
           steps.cycle_guard.outputs.escalate != 'true' &&
-          steps.concerns.outputs.no_concerns != 'true'
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.substantive.outputs.non_substantive != 'true'
         uses: actions/github-script@v7
         env:
           CONCERNS: ${{ steps.concerns.outputs.concerns }}
