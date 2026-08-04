@@ -14,6 +14,9 @@ A composite GitHub Action that runs an LLM-powered coding agent inside a workflo
 | `max-turns` | Maximum number of agentic loop iterations. | `"40"` | no |
 | `model` | Model identifier (e.g. deepseek-chat, gpt-4o). | `"deepseek-chat"` | no |
 | `api-base-url` | Base URL for the OpenAI-compatible API. | `"https://api.deepseek.com"` | no |
+| `mode` | `implement` or `revise`. In `revise` mode the agent addresses review concerns instead of implementing a plan. | `"implement"` | no |
+| `review-concerns` | Text of the Gate 1 review concerns to address (revise mode). | `""` | no |
+| `required-files` | JSON-encoded array of file paths the agent must restrict its changes to (used by the PR revise workflow to keep revisions on-target). Default `*` means no restriction. | `*` | no |
 
 ## Outputs
 
