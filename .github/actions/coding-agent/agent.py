@@ -13,6 +13,10 @@ Environment variables (set by the composite action):
     AGENT_ISSUE_NUMBER    — GitHub issue number
     AGENT_ISSUE_TITLE     — GitHub issue title
     AGENT_MAX_TURNS       — Max agentic loop iterations (default: 40)
+    AGENT_MODE            — implement | revise (default: implement)
+    AGENT_REVIEW_CONCERNS — Review concerns text (revise mode)
+    AGENT_REQUIRED_FILES  — JSON-encoded array of file paths the agent must
+                            restrict its changes to; "*" means no restriction
 """
 
 from __future__ import annotations
@@ -44,6 +48,7 @@ ISSUE_TITLE = os.environ.get("AGENT_ISSUE_TITLE", "")
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "40"))
 AGENT_MODE = os.environ.get("AGENT_MODE", "implement")
 AGENT_REVIEW_CONCERNS = os.environ.get("AGENT_REVIEW_CONCERNS", "")
+AGENT_REQUIRED_FILES = os.environ.get("AGENT_REQUIRED_FILES", "*")
 
 
 def log(msg: str) -> None:
@@ -150,7 +155,38 @@ WORKFLOW:
 REVIEW CONCERNS TO ADDRESS:
 {review_concerns}
 
+{required_files_section}
 END REVIEW CONCERNS"""
+
+
+def build_required_files_section() -> str:
+    """Build the constrained-file-scope section for the system prompt.
+
+    When the calling workflow passes a JSON-encoded list of file paths
+    (AGENT_REQUIRED_FILES), the agent must restrict its edits to exactly
+    those files so revisions stay on-target for Gate 1 feedback. The default
+    value "*" (or an empty/invalid list) means no restriction.
+    """
+    if not AGENT_REQUIRED_FILES or AGENT_REQUIRED_FILES == "*":
+        return ""
+    try:
+        files = json.loads(AGENT_REQUIRED_FILES)
+    except json.JSONDecodeError:
+        log(f"Warning: AGENT_REQUIRED_FILES is not valid JSON: {AGENT_REQUIRED_FILES}")
+        return ""
+    if not isinstance(files, list):
+        return ""
+    file_list = "\n".join(f"- {f}" for f in files if isinstance(f, str) and f)
+    if not file_list:
+        return ""
+    return (
+        "CONSTRAINED FILE SCOPE (MUST FOLLOW):\n"
+        "Restrict your changes to ONLY the following files. Do not modify any other "
+        "files unless the review concerns explicitly require it. If the requested "
+        "change cannot be made within these files, say so and stop rather than "
+        "editing unrelated files.\n"
+        f"{file_list}\n"
+    )
 
 
 def build_system_prompt(issue_data: dict) -> str:
@@ -158,6 +194,7 @@ def build_system_prompt(issue_data: dict) -> str:
         return REVISION_SYSTEM_PROMPT.format(
             branch_name=BRANCH_NAME,
             review_concerns=AGENT_REVIEW_CONCERNS,
+            required_files_section=build_required_files_section(),
         )
 
     issue_summary = build_issue_summary(issue_data)
@@ -167,12 +204,15 @@ def build_system_prompt(issue_data: dict) -> str:
     else:
         plan_section = "NO APPROVED PLAN FOUND — implement based on the issue body."
 
-    return SYSTEM_PROMPT.format(
-        branch_name=BRANCH_NAME,
-        issue_number=ISSUE_NUMBER,
-        issue_title=ISSUE_TITLE,
-        issue_summary=issue_summary,
-        plan_section=plan_section,
+    return (
+        SYSTEM_PROMPT.format(
+            branch_name=BRANCH_NAME,
+            issue_number=ISSUE_NUMBER,
+            issue_title=ISSUE_TITLE,
+            issue_summary=issue_summary,
+            plan_section=plan_section,
+        )
+        + build_required_files_section()
     )
 
 
@@ -379,6 +419,8 @@ def main() -> None:
     log(f"  Issue: #{ISSUE_NUMBER} — {ISSUE_TITLE}")
     log(f"  Branch: {BRANCH_NAME}")
     log(f"  Mode: {AGENT_MODE}")
+    if AGENT_REQUIRED_FILES and AGENT_REQUIRED_FILES != "*":
+        log(f"  Required files: {AGENT_REQUIRED_FILES}")
 
     success, turns_used = run_agent()
 
