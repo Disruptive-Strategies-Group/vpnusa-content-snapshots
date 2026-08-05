@@ -227,12 +227,12 @@ jobs:
 
           CONCERNS="${CONCERNS:-}"
 
-          # Extract file paths mentioned in the Gate 1 CHANGES_REQUESTED feedback
-          # using the approved regex:
-          #   \b[\w./-]+\.(liquid|yml|yaml|js|css)\b
+          # Extract file paths mentioned in the Gate 1 CHANGES_REQUESTED feedback.
+          # Matches any path-like token ending with a dot and 1-10 alphabetic chars
+          # to cover all common code/config file extensions (.ts, .py, .tf, .html, etc.)
           # Note: -P (PCRE) is used because GNU grep's ERE mode mishandles \w
           # inside a bracket expression; ubuntu-latest runners ship PCRE-enabled grep.
-          FILES="$(printf '%s\n' "${CONCERNS}" | grep -oP '\b[\w./-]+\.(liquid|yml|yaml|js|css)\b' | sort -u || true)"
+          FILES="$(printf '%s\n' "${CONCERNS}" | grep -oP '\b[\w./-]+\.[a-zA-Z][a-zA-Z0-9]{0,9}\b' | sort -u || true)"
 
           if [ -z "${FILES}" ]; then
             echo "no_files=true" >> "$GITHUB_OUTPUT"
@@ -263,8 +263,8 @@ jobs:
               owner, repo, issue_number: prNumber,
               body: [
                 '<!-- AGENT_REVISE_MANUAL_REVIEW -->',
-                '⚠️ **Manual review required** — Gate 1 feedback did not mention any file paths',
-                '(`.liquid`, `.yml`, `.yaml`, `.js`, `.css`), so the revision cannot be validated automatically.',
+                '⚠️ **Manual review required** — Gate 1 feedback did not mention any recognizable file paths,',
+                'so the revision cannot be validated automatically.',
                 '',
                 'A human reviewer must clarify the requested files or proceed manually.'
               ].join('\n')
