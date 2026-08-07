@@ -605,7 +605,7 @@ jobs:
     needs: [route, implement]
     if: >-
       always() &&
-      needs.route.result != 'skipped' &&
+      needs.route.result == 'success' &&
       needs.route.outputs.mode != 'ignore' &&
       !contains(join(github.event.issue.labels.*.name, ','), 'agent:do-not-run')
     runs-on: ubuntu-latest
