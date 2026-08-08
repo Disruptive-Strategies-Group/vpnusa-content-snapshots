@@ -235,14 +235,14 @@ jobs:
           FILES="$(printf '%s\n' "${CONCERNS}" | grep -oP '\b[\w./-]+\.[a-zA-Z][a-zA-Z0-9]{0,9}\b' | sort -u || true)"
 
           if [ -z "${FILES}" ]; then
-            echo "no_files=true" >> "$GITHUB_OUTPUT"
+            echo "no_files=false" >> "$GITHUB_OUTPUT"
             echo "required_files=[]" >> "$GITHUB_OUTPUT"
-            echo "No flagged file paths found in Gate 1 feedback."
+            echo "No flagged file paths found in review feedback. Proceeding with full concerns text."
           else
             echo "no_files=false" >> "$GITHUB_OUTPUT"
             REQUIRED_JSON="$(printf '%s\n' "${FILES}" | jq -R -s -c 'split("\n") | map(select(length > 0))')"
             echo "required_files=${REQUIRED_JSON}" >> "$GITHUB_OUTPUT"
-            echo "Flagged file paths extracted from Gate 1 feedback:"
+            echo "Flagged file paths extracted from review feedback:"
             printf '%s\n' "${FILES}"
           fi
 
@@ -263,7 +263,7 @@ jobs:
               owner, repo, issue_number: prNumber,
               body: [
                 '<!-- AGENT_REVISE_MANUAL_REVIEW -->',
-                '⚠️ **Manual review required** — Gate 1 feedback did not mention any recognizable file paths,',
+                '⚠️ **Manual review required** — review feedback did not mention any recognizable file paths,',
                 'so the revision cannot be validated automatically.',
                 '',
                 'A human reviewer must clarify the requested files or proceed manually.'
@@ -529,6 +529,9 @@ jobs:
           if [ "${TOUCHED}" = "true" ]; then
             echo "non_substantive=false" >> "$GITHUB_OUTPUT"
             echo "Revision is substantive — at least one flagged file was modified."
+          elif [ -z "${REQUIRED_FILES}" ] || [ "${REQUIRED_FILES}" = "[]" ]; then
+            echo "non_substantive=false" >> "$GITHUB_OUTPUT"
+            echo "No specific files were flagged in review feedback. Skipping substantive check."
           else
             echo "non_substantive=true" >> "$GITHUB_OUTPUT"
             echo "Revision is NON-SUBSTANTIVE — no flagged files were modified."
