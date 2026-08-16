@@ -64,3 +64,66 @@ jobs:
       - name: CI bootstrap check
         if: hashFiles('requirements.txt') == '' && hashFiles('pyproject.toml') == ''
         run: echo "CI check registered (non-Python repo)"
+
+  flyway-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine if Flyway files changed
+        id: filter
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ] && git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" | grep -q 'flyway/sql/'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Lint Flyway migration files
+        if: steps.filter.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXIT_CODE=0
+
+          for f in flyway/sql/*.sql; do
+            [ -f "$f" ] || continue
+            echo "Checking $f ..."
+
+            # Check 1: Reject any reference to flyway_schema_history
+            if grep -qi 'flyway_schema_history' "$f"; then
+              echo "ERROR: $f references flyway_schema_history. Flyway locks this table during every migration."
+              echo " ALTER TABLE ... OWNER TO or any DDL on flyway_schema_history will deadlock."
+              EXIT_CODE=1
+            fi
+
+            # Check 2: Require SET lock_timeout before any DDL statement
+            # DDL statements: ALTER TABLE, DROP TABLE, CREATE INDEX, REINDEX, TRUNCATE, ALTER INDEX
+            if grep -qiE '(ALTER\s+TABLE|DROP\s+TABLE|CREATE\s+INDEX|REINDEX|TRUNCATE|ALTER\s+INDEX)' "$f"; then
+              if ! grep -qi 'SET\s+lock_timeout' "$f"; then
+                echo "ERROR: $f contains DDL statements but no 'SET lock_timeout'."
+                echo " DDL without lock_timeout can hang indefinitely if a lock is held."
+                echo " Add 'SET lock_timeout = '30s';' (or similar) before any DDL statement."
+                EXIT_CODE=1
+              fi
+            fi
+
+            # Check 3: Flag bulk ownership transfers (high blast radius)
+            # Count occurrences of OWNER TO — more than 5 suggests a bulk transfer loop
+            OWNER_COUNT=$(grep -ciE '(ALTER\s+TABLE|ALTER\s+SEQUENCE|ALTER\s+SCHEMA).*OWNER\s+TO' "$f" || true)
+            if [ "$OWNER_COUNT" -gt 5 ]; then
+              echo "WARNING: $f contains $OWNER_COUNT ownership transfer statements."
+              echo " Bulk ownership transfers are high-blast-radius operations."
+              echo " Consider whether this can be scoped more narrowly."
+              EXIT_CODE=1
+            fi
+          done
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "Flyway lint checks failed. See errors above."
+            exit 1
+          fi
+          echo "All Flyway migration files passed lint checks."
