@@ -17,11 +17,7 @@ on:
       - "Deploy Anedot (SAM)"
       - "Deploy NationBuilder (SAM)"
       - "Terraform Deploy"
-      - "Terraform Deploy (FPC Tier 1)"
-      - "Terraform Deploy (FPC Analytics)"
-      - "Deploy Analytics Frontend (FPC)"
       - "Frontend Deploy"
-      - "Deploy Analytics Compute (FPC)"
       - "Deploy"
       - "quicksight-deploy"
     types: [completed]
