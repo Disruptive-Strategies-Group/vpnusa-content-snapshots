@@ -137,7 +137,7 @@ jobs:
       branch_advanced: ${{ steps.branch_advanced.outputs.branch_advanced }}
       pr_url: ${{ steps.pr.outputs.pr_url }}
     env:
-      DEFAULT_BRANCH: main
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       ISSUE_NUMBER: ${{ needs.route.outputs.issue_number }}
       ISSUE_TITLE: ${{ needs.route.outputs.issue_title }}
       BRANCH_NAME: ${{ needs.route.outputs.branch_name }}
@@ -318,6 +318,11 @@ jobs:
           git restore --staged --worktree .claude/settings.json 2>/dev/null || true
           git restore --staged --worktree .github/workflows 2>/dev/null || true
           rm -rf .agent
+
+          # Remove tracked __pycache__ directories and .pyc files to prevent accidental binary commits
+          find . -path '*/__pycache__/*.pyc' -exec git rm --cached --quiet {} \; 2>/dev/null || true
+          find . -name '*.pyc' -exec git rm --cached --quiet {} \; 2>/dev/null || true
+          find . -type d -name '__pycache__' -exec git rm --cached --quiet -r {} \; 2>/dev/null || true
 
           # Clean up junk files from shell redirect interpretation of version specifiers
           # e.g., "pip install pkg>=1.0" creates a file named "=1.0" via the ">" redirect
@@ -614,7 +619,7 @@ jobs:
       MODE: ${{ needs.route.outputs.mode }}
       ISSUE_NUMBER: ${{ needs.route.outputs.issue_number }}
       IMPLEMENT_RESULT: ${{ needs.implement.result }}
-      DEFAULT_BRANCH: main
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       BRANCH_NAME: ${{ needs.route.outputs.branch_name }}
       PR_URL: ${{ needs.implement.outputs.pr_url }}
       NO_CHANGES: ${{ needs.implement.outputs.no_changes }}
