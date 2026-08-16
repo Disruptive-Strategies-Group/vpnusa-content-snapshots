@@ -129,12 +129,6 @@ jobs:
               echo "db_name=postgres" >> "$GITHUB_OUTPUT"
               SECRET_ARN="arn:aws:secretsmanager:us-east-2:193527004156:secret:rds!db-0cae1482-27e2-4f32-9e7a-26ed5dcfeb08-CAKrOD"
               ;;
-            FPC)
-              echo "bastion=i-07ba250380758a779" >> "$GITHUB_OUTPUT"
-              echo "db_host=fpc-data-lake.crecs6i40087.us-east-2.rds.amazonaws.com" >> "$GITHUB_OUTPUT"
-              echo "db_name=fpc_data_lake" >> "$GITHUB_OUTPUT"
-              SECRET_ARN="arn:aws:secretsmanager:us-east-2:604860202807:secret:rds!db-c79b93bd-346b-442d-8ea2-01cd14361de4-r3eHNC"
-              ;;
             AERIS_RAG)
               echo "bastion=i-06f8112c568d8afa4" >> "$GITHUB_OUTPUT"
               echo "db_host=aeris-rag.c12404wg0jbg.us-east-2.rds.amazonaws.com" >> "$GITHUB_OUTPUT"
