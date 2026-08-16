@@ -426,6 +426,11 @@ jobs:
           done
           rm -rf .agent .claude-pr
 
+          # Remove tracked __pycache__ directories and .pyc files to prevent accidental binary commits
+          find . -path '*/__pycache__/*.pyc' -exec git rm --cached --quiet {} \; 2>/dev/null || true
+          find . -name '*.pyc' -exec git rm --cached --quiet {} \; 2>/dev/null || true
+          find . -type d -name '__pycache__' -exec git rm --cached --quiet -r {} \; 2>/dev/null || true
+
           # Commit any uncommitted working tree changes left by Claude
           if [ -n "$(git status --porcelain)" ]; then
             echo "Working tree changes detected; creating safety-net commit."
@@ -499,6 +504,7 @@ jobs:
         env:
           REQUIRED_FILES: ${{ steps.feedback_parse.outputs.required_files }}
           PRE_SHA: ${{ steps.pre_push_sha.outputs.pre_push_sha }}
+          CONCERNS: ${{ steps.concerns.outputs.concerns }}
         run: |
           set -euo pipefail
 
@@ -511,6 +517,15 @@ jobs:
 
           echo "Changed files in this revision:"
           printf '%s\n' "${CHANGED}"
+
+          # Extract search terms from the Gate 1 feedback: any quoted tokens
+          # (e.g. "fpc", "FPC", "604860202807") become an alternation pattern
+          # used to test whether a flagged file still contains the problematic
+          # content. If no quoted terms exist, the pattern stays empty and the
+          # revision is treated as substantive (no indefinite blocking).
+          CONCERNS="${CONCERNS:-}"
+          SEARCH_PATTERN="$(printf '%s' "${CONCERNS}" | grep -oE '\"[^\"]+\"' | tr -d '\"' | sort -u | paste -sd '|' - || true)"
+          echo "Search pattern extracted from feedback: '${SEARCH_PATTERN}'"
 
           TOUCHED=false
           REQUIRED_FILES="${REQUIRED_FILES:-}"
@@ -533,8 +548,26 @@ jobs:
             echo "non_substantive=false" >> "$GITHUB_OUTPUT"
             echo "No specific files were flagged in review feedback. Skipping substantive check."
           else
-            echo "non_substantive=true" >> "$GITHUB_OUTPUT"
-            echo "Revision is NON-SUBSTANTIVE — no flagged files were modified."
+            # None of the flagged files were modified. Test whether they still
+            # contain the problematic content referenced in the Gate 1 feedback.
+            # Files that no longer contain the search terms are "already clean"
+            # and must not cause the revision to be declared non-substantive.
+            STILL_DIRTY=()
+            while IFS= read -r f; do
+              [ -z "${f}" ] && continue
+              if [ -n "${SEARCH_PATTERN}" ] && grep -qiE -- "${SEARCH_PATTERN}" "$f" 2>/dev/null; then
+                STILL_DIRTY+=("$f")
+              fi
+            done < <(printf '%s' "${REQUIRED_FILES}" | jq -r '.[]')
+
+            if [ ${#STILL_DIRTY[@]} -eq 0 ]; then
+              echo "non_substantive=false" >> "$GITHUB_OUTPUT"
+              echo "All flagged files are either modified or already clean."
+            else
+              echo "non_substantive=true" >> "$GITHUB_OUTPUT"
+              echo "Revision is NON-SUBSTANTIVE — flagged files still contain problematic content:"
+              printf '%s\n' "${STILL_DIRTY[@]}"
+            fi
           fi
 
       - name: Block PR — non-substantive revision
