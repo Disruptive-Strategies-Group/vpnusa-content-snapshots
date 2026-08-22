@@ -1,12 +1,12 @@
 name: DSG Coding Agent
 description: >-
-  Agentic coding loop using DeepSeek (or compatible OpenAI-format API).
+  Agentic coding loop using OpenRouter (or compatible OpenAI-format API).
   Reads issue context, follows the approved plan, edits files, and commits locally.
   Does NOT push or create PRs — the calling workflow handles that.
 
 inputs:
   api-key:
-    description: API key for the LLM provider (DeepSeek, OpenAI, etc).
+    description: API key for the LLM provider (OpenRouter, OpenAI, etc).
     required: true
   issue-context:
     description: Path to the issue context JSON file (.agent/issue-context.json).
@@ -41,13 +41,13 @@ inputs:
     required: false
     default: "*"
   model:
-    description: Model identifier (e.g. deepseek-v4-flash, gpt-4o).
+    description: Model identifier (e.g. deepseek/deepseek-v4-flash-0731, gpt-4o).
     required: false
-    default: "deepseek-v4-flash"
+    default: "deepseek/deepseek-v4-flash-0731"
   api-base-url:
     description: Base URL for the OpenAI-compatible API.
     required: false
-    default: "https://api.deepseek.com"
+    default: "https://openrouter.ai/api/v1"
 
 outputs:
   outcome:
