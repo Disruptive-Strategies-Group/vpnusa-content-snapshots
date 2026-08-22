@@ -1,19 +1,19 @@
 # DSG Coding Agent
 
-A composite GitHub Action that runs an LLM-powered coding agent inside a workflow. It reads issue context and an approved plan, then iterates through a ReAct-style tool-call loop — exploring the repository, editing files, running commands, and committing changes locally. The agent defaults to DeepSeek (`deepseek-chat` via `https://api.deepseek.com`) but accepts any OpenAI-compatible API provider.
+A composite GitHub Action that runs an LLM-powered coding agent inside a workflow. It reads issue context and an approved plan, then iterates through a ReAct-style tool-call loop — exploring the repository, editing files, running commands, and committing changes locally. The agent defaults to OpenRouter (`deepseek/deepseek-v4-flash-0731` via `https://openrouter.ai/api/v1`) but accepts any OpenAI-compatible API provider.
 
 ## Inputs
 
 | Input | Description | Default | Required |
 |-------|-------------|---------|----------|
-| `api-key` | API key for the LLM provider (DeepSeek, OpenAI, etc). | — | yes |
+| `api-key` | API key for the LLM provider (OpenRouter, OpenAI, etc). | — | yes |
 | `issue-context` | Path to the issue context JSON file (`.agent/issue-context.json`). | — | yes |
 | `branch-name` | Git branch the agent is working on. | — | yes |
 | `issue-number` | GitHub issue number for commit messages. | — | yes |
 | `issue-title` | GitHub issue title for commit messages. | `""` | no |
 | `max-turns` | Maximum number of agentic loop iterations. | `"40"` | no |
-| `model` | Model identifier (e.g. deepseek-chat, gpt-4o). | `"deepseek-chat"` | no |
-| `api-base-url` | Base URL for the OpenAI-compatible API. | `"https://api.deepseek.com"` | no |
+| `model` | Model identifier (e.g. deepseek/deepseek-v4-flash-0731, gpt-4o). | `"deepseek/deepseek-v4-flash-0731"` | no |
+| `api-base-url` | Base URL for the OpenAI-compatible API. | `"https://openrouter.ai/api/v1"` | no |
 | `mode` | `implement` or `revise`. In `revise` mode the agent addresses review concerns instead of implementing a plan. | `"implement"` | no |
 | `review-concerns` | Text of the Gate 1 review concerns to address (revise mode). | `""` | no |
 | `required-files` | JSON-encoded array of file paths the agent must restrict its changes to (used by the PR revise workflow to keep revisions on-target). Default `*` means no restriction. | `*` | no |
@@ -36,17 +36,17 @@ A composite GitHub Action that runs an LLM-powered coding agent inside a workflo
 
 ## Provider configuration
 
-By default the agent uses DeepSeek (`api-base-url: "https://api.deepseek.com"`, `model: "deepseek-chat"`). You can switch to any OpenAI-compatible API by overriding the `api-base-url` and `model` inputs.
+By default the agent uses OpenRouter (`api-base-url: "https://openrouter.ai/api/v1"`, `model: "deepseek/deepseek-v4-flash-0731"`). You can switch to any OpenAI-compatible API by overriding the `api-base-url` and `model` inputs.
 
 ## Usage example
 
-**Default (DeepSeek):**
+**Default (OpenRouter):**
 
 ```yaml
 - name: Run coding agent
   uses: ./.github/actions/coding-agent
   with:
-    api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+    api-key: ${{ secrets.OPENROUTER_API_KEY }}
     issue-context: .agent/issue-context.json
     branch-name: ${{ github.head_ref }}
     issue-number: ${{ github.event.number }}
