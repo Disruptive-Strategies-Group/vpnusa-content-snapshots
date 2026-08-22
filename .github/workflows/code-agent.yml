@@ -12,6 +12,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  id-token: write
   contents: write
   pull-requests: write
   issues: write
@@ -157,12 +158,36 @@ jobs:
       - name: Preflight secrets
         shell: bash
         env:
-          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          INTEGRATIONS_SECRET_ARN: ${{ secrets.INTEGRATIONS_SECRET_ARN }}
           DSG_AGENTIC_APP_ID: ${{ secrets.DSG_AGENTIC_APP_ID }}
         run: |
           set -euo pipefail
-          test -n "${DEEPSEEK_API_KEY}" || (echo "ERROR: DEEPSEEK_API_KEY missing/empty" && exit 1)
+          test -n "${INTEGRATIONS_SECRET_ARN}" || (echo "ERROR: INTEGRATIONS_SECRET_ARN missing/empty" && exit 1)
           test -n "${DSG_AGENTIC_APP_ID}" || (echo "ERROR: DSG_AGENTIC_APP_ID missing/empty" && exit 1)
+
+      - name: Configure AWS credentials (OIDC)
+        id: aws
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - name: Fetch OpenRouter key from Secrets Manager
+        id: creds
+        shell: bash
+        env:
+          INTEGRATIONS_SECRET_ARN: ${{ secrets.INTEGRATIONS_SECRET_ARN }}
+        run: |
+          set -euo pipefail
+          KEY=$(aws secretsmanager get-secret-value \
+            --secret-id "${INTEGRATIONS_SECRET_ARN}" \
+            --query SecretString --output text | jq -r '.openrouter_api_key // empty')
+          if [ -z "${KEY}" ]; then
+            echo "ERROR: openrouter_api_key not readable from INTEGRATIONS_SECRET_ARN"
+            exit 1
+          fi
+          echo "::add-mask::${KEY}"
+          echo "OPENROUTER_API_KEY=${KEY}" >> "$GITHUB_ENV"
 
       - name: Read lifecycle settings
         id: lifecycle
@@ -297,7 +322,7 @@ jobs:
         id: claude
         uses: ./.github/actions/coding-agent
         with:
-          api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          api-key: ${{ env.OPENROUTER_API_KEY }}
           issue-context: .agent/issue-context.json
           branch-name: ${{ env.BRANCH_NAME }}
           issue-number: ${{ env.ISSUE_NUMBER }}
@@ -661,7 +686,7 @@ jobs:
               return $rc
             done
           }
-          EXISTING=$(gh_with_retry issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json comments --jq '[.comments[].body | select(startswith("<!-- AGENT_BLOCKED -->"))] | length')
+          EXISTING=$(gh_with_retry issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json comments --jq '([.comments[] | select(.body | startswith("/agent approve")) | .createdAt] | last) as $since | [.comments[] | select(.createdAt > ($since // "1970-01-01T00:00:00Z")) | .body | select(startswith("<!-- AGENT_BLOCKED -->"))] | length')
           echo "count=$EXISTING" >> "$GITHUB_OUTPUT"
 
       - name: Read lifecycle settings
