@@ -6,8 +6,8 @@ coding loop. Uses any OpenAI-compatible API (DeepSeek, OpenAI, etc).
 
 Environment variables (set by the composite action):
     AGENT_API_KEY         — API key for the LLM provider
-    AGENT_API_BASE_URL    — Base URL (default: https://api.deepseek.com)
-    AGENT_MODEL           — Model name (default: deepseek-chat)
+    AGENT_API_BASE_URL    — Base URL (default: https://openrouter.ai/api/v1)
+    AGENT_MODEL           — Model name (default: deepseek/deepseek-v4-flash-0731)
     AGENT_ISSUE_CONTEXT   — Path to .agent/issue-context.json
     AGENT_BRANCH_NAME     — Git branch to work on
     AGENT_ISSUE_NUMBER    — GitHub issue number
@@ -39,8 +39,8 @@ VERSION = "0.1.0"
 # ---------------------------------------------------------------------------
 
 API_KEY = os.environ["AGENT_API_KEY"]
-API_BASE_URL = os.environ.get("AGENT_API_BASE_URL", "https://api.deepseek.com")
-MODEL = os.environ.get("AGENT_MODEL", "deepseek-chat")
+API_BASE_URL = os.environ.get("AGENT_API_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL = os.environ.get("AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
 ISSUE_CONTEXT_PATH = os.environ["AGENT_ISSUE_CONTEXT"]
 BRANCH_NAME = os.environ["AGENT_BRANCH_NAME"]
 ISSUE_NUMBER = os.environ["AGENT_ISSUE_NUMBER"]
