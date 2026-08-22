@@ -15,9 +15,10 @@
 # no key is duplicated into GitHub secrets.
 #
 # Required org secrets:
+#   INTEGRATIONS_SECRET_ARN       — ARN of the integrations secret holding
+#                                   openrouter_api_key
 #   AWS_DEPLOY_ROLE_ARN           — existing OIDC deploy role (already set org-wide);
-#                                   the role has scoped GetSecretValue on the
-#                                   aeris-integrations secret
+#                                   the role has scoped GetSecretValue on that secret
 #   DSG_COMMENTER_APP_ID/_PRIVATE_KEY — review identity (falls back to a plain
 #                                   comment if absent; revise loop won't auto-fire)
 
@@ -100,6 +101,8 @@ jobs:
       - name: Fetch OpenRouter key from Secrets Manager
         id: creds
         if: steps.ctx.outputs.skip != 'true'
+        env:
+          INTEGRATIONS_SECRET_ARN: ${{ secrets.INTEGRATIONS_SECRET_ARN }}
         run: |
           if [ "${{ steps.aws.outcome }}" != "success" ]; then
             echo "WARNING: OIDC role assumption failed — design QA cannot run. Passing through."
@@ -107,7 +110,7 @@ jobs:
             exit 0
           fi
           KEY=$(aws secretsmanager get-secret-value \
-            --secret-id "arn:aws:secretsmanager:us-east-2:193527004156:secret:aeris-integrations-H8lBNN" \
+            --secret-id "${INTEGRATIONS_SECRET_ARN}" \
             --query SecretString --output text 2>/dev/null | jq -r '.openrouter_api_key // empty')
           if [ -z "${KEY}" ]; then
             echo "WARNING: openrouter_api_key not readable from Secrets Manager — passing through."
