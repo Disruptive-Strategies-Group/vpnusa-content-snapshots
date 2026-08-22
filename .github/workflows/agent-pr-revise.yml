@@ -5,6 +5,7 @@ on:
     types: [submitted]
 
 permissions:
+  id-token: write
   contents: write
   pull-requests: write
   issues: write
@@ -232,7 +233,7 @@ jobs:
           # to cover all common code/config file extensions (.ts, .py, .tf, .html, etc.)
           # Note: -P (PCRE) is used because GNU grep's ERE mode mishandles \w
           # inside a bracket expression; ubuntu-latest runners ship PCRE-enabled grep.
-          FILES="$(printf '%s\n' "${CONCERNS}" | grep -oP '\b[\w./-]+\.[a-zA-Z][a-zA-Z0-9]{0,9}\b' | sort -u || true)"
+          FILES="$(printf '%s\n' "${CONCERNS}" | grep -oP '\b[\w-]+/[\w./-]+\.[a-zA-Z][a-zA-Z0-9]{0,9}\b' | sort -u || true)"
 
           if [ -z "${FILES}" ]; then
             echo "no_files=false" >> "$GITHUB_OUTPUT"
@@ -364,6 +365,40 @@ jobs:
           echo "pre_push_sha=${sha}" >> "$GITHUB_OUTPUT"
           echo "Pre-push SHA: ${sha}"
 
+      - name: Configure AWS credentials (OIDC)
+        id: aws
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-2
+
+      - name: Fetch OpenRouter key from Secrets Manager
+        id: creds
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true'
+        shell: bash
+        env:
+          INTEGRATIONS_SECRET_ARN: ${{ secrets.INTEGRATIONS_SECRET_ARN }}
+        run: |
+          set -euo pipefail
+          KEY=$(aws secretsmanager get-secret-value \
+            --secret-id "${INTEGRATIONS_SECRET_ARN}" \
+            --query SecretString --output text | jq -r '.openrouter_api_key // empty')
+          if [ -z "${KEY}" ]; then
+            echo "ERROR: openrouter_api_key not readable from INTEGRATIONS_SECRET_ARN"
+            exit 1
+          fi
+          echo "::add-mask::${KEY}"
+          echo "OPENROUTER_API_KEY=${KEY}" >> "$GITHUB_ENV"
+
       - name: Revision agent
         if: >
           steps.cycle_guard.outputs.escalate != 'true' &&
@@ -374,7 +409,7 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/coding-agent
         with:
-          api-key: ${{ secrets.DEEPSEEK_API_KEY }}
+          api-key: ${{ env.OPENROUTER_API_KEY }}
           issue-context: .agent/issue-context.json
           branch-name: ${{ steps.meta.outputs.head_ref }}
           issue-number: ${{ steps.meta.outputs.pr_number }}
@@ -435,9 +470,9 @@ jobs:
           if [ -n "$(git status --porcelain)" ]; then
             echo "Working tree changes detected; creating safety-net commit."
             git add -A
-            git commit -m "Agent: revise PR #${{ steps.meta.outputs.pr_number }}"
+            git commit -m "safety net: capture any uncommitted changes"
           else
-            echo "No uncommitted working tree changes."
+            echo "No changes to commit."
           fi
 
           # Fallback: if this run produced no new commit, force a no-op commit to re-trigger CI
