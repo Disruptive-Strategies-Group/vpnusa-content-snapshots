@@ -50,6 +50,10 @@ AGENT_MODE = os.environ.get("AGENT_MODE", "implement")
 AGENT_REVIEW_CONCERNS = os.environ.get("AGENT_REVIEW_CONCERNS", "")
 AGENT_REQUIRED_FILES = os.environ.get("AGENT_REQUIRED_FILES", "*")
 
+# Context budget for the message window. When total serialized chars exceed
+# this, _compact_messages() reclaims space (~45K tokens, approaching 64K limit).
+CONTEXT_BUDGET_CHARS = 180_000
+
 
 def log(msg: str) -> None:
     print(f"[agent] {msg}", flush=True)
@@ -251,6 +255,12 @@ def run_agent() -> tuple[bool, int]:
     repeated_fail_sigs: list[str] = []
     stuck_redirects = 0
 
+    # Stuck-loop detection: track consecutive identical successful tool calls that
+    # never make progress (no intervening edit_file/write_file).
+    repeated_success_sigs: list[str] = []
+    stuck_success_redirects = 0
+    wrote_since_success_reset = False
+
     while turns < MAX_TURNS:
         turns += 1
         log(f"--- Turn {turns}/{MAX_TURNS} ---")
@@ -300,6 +310,10 @@ def run_agent() -> tuple[bool, int]:
 
             result = execute_tool(fn_name, fn_args)
 
+            # Any edit/write call breaks the "read loop that never writes" signal.
+            if fn_name in ("edit_file", "write_file"):
+                wrote_since_success_reset = True
+
             if result["is_error"]:
                 log(f"  Error: {result['output'][:200]}")
                 # Track consecutive identical failing tool calls
@@ -312,6 +326,16 @@ def run_agent() -> tuple[bool, int]:
                 log(f"  OK: {output_preview}...")
                 # Successful tool call resets failure tracking
                 repeated_fail_sigs = []
+                # Track consecutive identical successful tool calls using the same
+                # signature (fn_name + sorted args) as the failing-call detector.
+                sig = hashlib.md5(
+                    f"{fn_name}:{json.dumps(fn_args, sort_keys=True)}".encode()
+                ).hexdigest()
+                if repeated_success_sigs and repeated_success_sigs[-1] == sig:
+                    repeated_success_sigs.append(sig)
+                else:
+                    repeated_success_sigs = [sig]
+                    wrote_since_success_reset = False
 
             messages.append(
                 {
@@ -350,12 +374,48 @@ def run_agent() -> tuple[bool, int]:
             repeated_fail_sigs = []
             log(f"Redirect injected (attempt {stuck_redirects}/2)")
 
+        # Stuck-loop detection: check for repeated identical successful tool calls
+        # with no intervening edit_file/write_file (a read loop that never writes).
+        if (
+            len(repeated_success_sigs) >= 3
+            and len(set(repeated_success_sigs[-3:])) == 1
+            and not wrote_since_success_reset
+        ):
+            log(
+                f"WARNING: Agent repeated the same successful tool call "
+                f"{len(repeated_success_sigs)} times consecutively with no "
+                f"edit_file/write_file (success repetition loop)"
+            )
+            if stuck_success_redirects >= 2:
+                log(
+                    "Agent stuck in success repetition loop after redirect "
+                    "attempts, aborting"
+                )
+                return False, turns
+            # Inject a redirect message to nudge the model toward making progress
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "SYSTEM: You have repeated the same successful tool call "
+                        f"{len(repeated_success_sigs)} times with no edits or writes. "
+                        "You are not making progress. Try a completely different "
+                        "strategy — make the actual code changes required, or use a "
+                        "different approach to accomplish the task."
+                    ),
+                }
+            )
+            stuck_success_redirects += 1
+            repeated_success_sigs = []
+            wrote_since_success_reset = False
+            log(f"Success-loop redirect injected (attempt {stuck_success_redirects}/2)")
+
         # Context window management: if messages are getting very large,
         # summarize older tool results to stay within limits
         total_chars = sum(
             len(json.dumps(m)) for m in messages
         )
-        if total_chars > 180_000:  # ~45K tokens, approaching 64K limit
+        if total_chars > CONTEXT_BUDGET_CHARS:
             log(f"Context approaching limit ({total_chars} chars), compacting...")
             messages = _compact_messages(messages)
 
@@ -374,28 +434,98 @@ def _summarize_args(args: dict) -> str:
     return ", ".join(parts)
 
 
-def _compact_messages(messages: list[dict]) -> list[dict]:
-    """Truncate older tool results to free up context space.
+def _total_chars(messages: list[dict]) -> int:
+    """Total serialized character count of a message list."""
+    return sum(len(json.dumps(m)) for m in messages)
 
-    Keeps the system prompt and last 10 messages intact; truncates tool
-    content in older messages to 500 chars each.
+
+def _truncate_content(msg: dict, limit: int) -> None:
+    """Truncate a message's string content in place to `limit` chars."""
+    content = msg.get("content", "")
+    if isinstance(content, str) and len(content) > limit:
+        msg["content"] = content[:limit] + "\n[TRUNCATED for context management]"
+
+
+def _compact_messages(messages: list[dict]) -> list[dict]:
+    """Compact messages to stay within the context budget.
+
+    Progressive, budget-aware compaction that operates on every message
+    except the system prompt (messages[0]), which is always preserved.
+    Reclaims space in phases, stopping as soon as the total char count
+    drops under CONTEXT_BUDGET_CHARS:
+
+    1. Truncate all reclaimable messages (tool/assistant/user) to 2000 chars.
+    2. Truncate all reclaimable messages to 500 chars.
+    3. Drop the oldest tool messages entirely, one by one (oldest first).
+    4. Truncate assistant/user messages to 200 chars.
+    5. Drop the oldest assistant/user messages until the budget is met.
+
+    Tool output is sacrificed before assistant reasoning, and user messages
+    last. If the budget still cannot be met after exhausting all reclaimable
+    content, a distinct WARNING is logged so the budget constants can be
+    tuned rather than failing silently.
     """
-    if len(messages) <= 12:
+    if len(messages) <= 1:
         return messages
 
-    compacted = [messages[0]]  # system prompt
-    boundary = len(messages) - 10
+    before_chars = _total_chars(messages)
+    compacted = [dict(m) for m in messages]
+    reclaimable = ("tool", "assistant", "user")
 
-    for i, msg in enumerate(messages[1:], 1):
-        if i < boundary and msg.get("role") == "tool":
-            content = msg.get("content", "")
-            if len(content) > 500:
-                msg = dict(msg)
-                msg["content"] = content[:500] + "\n[TRUNCATED for context management]"
-        compacted.append(msg)
+    def _under_budget() -> bool:
+        return _total_chars(compacted) <= CONTEXT_BUDGET_CHARS
 
-    log(f"Compacted messages from {len(messages)} to {len(compacted)} entries")
-    return compacted
+    def _finish() -> list[dict]:
+        after_chars = _total_chars(compacted)
+        reclaimed = before_chars - after_chars
+        log(
+            f"Compacted messages: {before_chars} -> {after_chars} chars "
+            f"({reclaimed} reclaimed)"
+        )
+        return compacted
+
+    # Phase 1 — Generative truncation: shrink all reclaimable messages to 2000 chars.
+    for msg in compacted[1:]:
+        if msg.get("role") in reclaimable:
+            _truncate_content(msg, 2000)
+    if _under_budget():
+        return _finish()
+
+    # Phase 2 — Aggressive truncation: shrink all reclaimable messages to 500 chars.
+    for msg in compacted[1:]:
+        if msg.get("role") in reclaimable:
+            _truncate_content(msg, 500)
+    if _under_budget():
+        return _finish()
+
+    # Phase 3 — Drop the oldest tool messages entirely (oldest first).
+    for msg in list(compacted[1:]):
+        if msg.get("role") == "tool":
+            compacted.remove(msg)
+            if _under_budget():
+                return _finish()
+
+    # Phase 4 — Truncate assistant/user messages to 200 chars.
+    for msg in compacted[1:]:
+        if msg.get("role") in ("assistant", "user"):
+            _truncate_content(msg, 200)
+    if _under_budget():
+        return _finish()
+
+    # Phase 5 — Drop the oldest assistant/user messages until under budget.
+    for msg in list(compacted[1:]):
+        if msg.get("role") in ("assistant", "user"):
+            compacted.remove(msg)
+            if _under_budget():
+                return _finish()
+
+    # Exhausted all reclaimable content and still over budget — log distinctly.
+    log(
+        f"WARNING: Compaction exhausted all reclaimable content but context is "
+        f"still over budget: {_total_chars(compacted)} chars "
+        f"(threshold {CONTEXT_BUDGET_CHARS}). Budget constants need tuning."
+    )
+    return _finish()
 
 
 # ---------------------------------------------------------------------------
