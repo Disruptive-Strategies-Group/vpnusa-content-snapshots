@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-MAX_FILE_SIZE = 32_000  # chars — truncate reads beyond this
+MAX_FILE_SIZE = 8_000  # chars — truncate reads beyond this
 MAX_BASH_OUTPUT = 16_000  # chars — truncate bash stdout/stderr beyond this
 BASH_TIMEOUT = 120  # seconds
 
