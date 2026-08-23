@@ -437,11 +437,9 @@ jobs:
               owner, repo, issue_number: prNumber,
               body: [
                 '<!-- AGENT_REVISE_ERROR -->',
-                '⚠️ **Agent step failed during revision** — the safety-net noop commit was pushed to keep CI alive, but no code changes were made.',
-                '',
-                'Check the [workflow run logs](' +
+                '⚠️ **Agent step failed during revision** — no code changes were made. The workflow may have attempted a safety-net/no-op commit to keep CI alive; check the [workflow run logs](' +
                   `https://github.com/${owner}/${repo}/actions/runs/${{ github.run_id }}` +
-                  ') for the root cause.'
+                  ') to confirm whether a commit was actually pushed.'
               ].join('\n')
             });
 
@@ -466,11 +464,13 @@ jobs:
           find . -name '*.pyc' -exec git rm --cached --quiet {} \; 2>/dev/null || true
           find . -type d -name '__pycache__' -exec git rm --cached --quiet -r {} \; 2>/dev/null || true
 
-          # Commit any uncommitted working tree changes left by Claude
+          # Commit any uncommitted working tree changes left by Claude.
+          # Guard on stageability after `git add -A` rather than on porcelain,
+          # so a dirty-but-nothing-stageable tree does not fail the step.
           if [ -n "$(git status --porcelain)" ]; then
             echo "Working tree changes detected; creating safety-net commit."
             git add -A
-            git commit -m "safety net: capture any uncommitted changes"
+            git diff --cached --quiet || git commit -m "safety net: capture any uncommitted changes"
           else
             echo "No changes to commit."
           fi
