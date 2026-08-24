@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
-MAX_FILE_SIZE = 8_000  # chars — truncate reads beyond this
+MAX_FILE_SIZE = 50_000  # chars — truncate reads beyond this (raised from 8K; large source files like worker.ts are 108K)
 MAX_BASH_OUTPUT = 16_000  # chars — truncate bash stdout/stderr beyond this
 BASH_TIMEOUT = 120  # seconds
 
@@ -31,7 +31,8 @@ TOOL_SCHEMAS = [
             "name": "read_file",
             "description": (
                 "Read the contents of a file. Returns the full text for files under "
-                f"{MAX_FILE_SIZE} characters; larger files are truncated with a note."
+                f"{MAX_FILE_SIZE} characters; larger files are truncated with a note. "
+                "For large files that are truncated, use read_file_lines to read specific line ranges."
             ),
             "parameters": {
                 "type": "object",
@@ -165,6 +166,36 @@ TOOL_SCHEMAS = [
                     },
                 },
                 "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file_lines",
+            "description": (
+                "Read a specific range of lines from a file. Use this when read_file "
+                "truncates a large file and you need to see a specific section. "
+                "Returns lines with line numbers. Use grep_search first to find the "
+                "line numbers you need, then use this tool to read that section."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the file from the repo root.",
+                    },
+                    "start_line": {
+                        "type": "integer",
+                        "description": "Starting line number (1-based, default: 1).",
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "description": "Ending line number (inclusive, default: 200).",
+                    },
+                },
+                "required": ["path"],
             },
         },
     },
@@ -338,6 +369,44 @@ def grep_search(pattern: str, path: str = ".", include: str | None = None) -> di
         return {"output": f"Error running grep: {e}", "is_error": True}
 
 
+def read_file_lines(path: str, start_line: int = 1, end_line: int = 200) -> dict[str, Any]:
+    """Read a specific range of lines from a file, with line numbers.
+
+    Use this when read_file truncates a large file and you need to see
+    a specific section. Use grep_search first to find the line numbers
+    of the code you need to modify, then use this tool to read that section.
+    """
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {"output": f"File not found: {path}", "is_error": True}
+        if not p.is_file():
+            return {"output": f"Not a file: {path}", "is_error": True}
+        content = p.read_text(encoding="utf-8", errors="replace")
+        lines = content.split("\n")
+        total = len(lines)
+        if start_line < 1:
+            start_line = 1
+        if end_line > total:
+            end_line = total
+        if start_line > total:
+            return {
+                "output": f"start_line {start_line} exceeds total {total} lines in {path}",
+                "is_error": True,
+            }
+        selected = lines[start_line - 1 : end_line]
+        numbered = "\n".join(
+            f"{i}: {line}" for i, line in enumerate(selected, start=start_line)
+        )
+        header = f"(File: {path}, showing lines {start_line}-{end_line} of {total})\n"
+        return {
+            "output": _truncate(header + numbered, MAX_BASH_OUTPUT),
+            "is_error": False,
+        }
+    except Exception as e:
+        return {"output": f"Error reading lines from {path}: {e}", "is_error": True}
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
@@ -350,6 +419,9 @@ TOOL_DISPATCH = {
     "list_files": lambda args: list_files(args["pattern"]),
     "grep_search": lambda args: grep_search(
         args["pattern"], args.get("path", "."), args.get("include")
+    ),
+    "read_file_lines": lambda args: read_file_lines(
+        args["path"], args.get("start_line", 1), args.get("end_line", 200)
     ),
 }
 
