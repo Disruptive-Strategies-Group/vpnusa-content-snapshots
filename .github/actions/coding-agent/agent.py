@@ -156,6 +156,9 @@ WORKFLOW:
 6. After editing, verify with `git diff` that changes look correct.
 7. Commit with a message listing the specific files changed and what was changed.
 
+LARGE FILE HANDLING:
+If read_file returns a truncated view of a file (you will see a TRUNCATED message), use grep_search to find the exact line numbers of the code you need to modify, then use read_file_lines to read that specific section. This is essential for files over 50,000 characters. Never attempt edit_file on code you have not directly read — the old_text will not match and the edit will fail.
+
 REVIEW CONCERNS TO ADDRESS:
 {review_concerns}
 
@@ -238,14 +241,23 @@ def run_agent() -> tuple[bool, int]:
 
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
-        {
+    ]
+    if AGENT_MODE == "revise":
+        messages.append({
+            "role": "user",
+            "content": (
+                "Address the review concerns listed in the system prompt. "
+                "Start by running git diff to see what this branch has changed, "
+                "then modify the flagged files to resolve each concern."
+            ),
+        })
+    else:
+        messages.append({
             "role": "user",
             "content": (
                 f"Implement the changes for issue #{ISSUE_NUMBER}. "
                 "Start by exploring the repository structure, then follow the approved plan."
             ),
-        },
-    ]
 
     turns = 0
     consecutive_errors = 0
