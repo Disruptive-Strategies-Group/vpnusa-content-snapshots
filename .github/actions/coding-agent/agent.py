@@ -258,6 +258,7 @@ def run_agent() -> tuple[bool, int]:
                 f"Implement the changes for issue #{ISSUE_NUMBER}. "
                 "Start by exploring the repository structure, then follow the approved plan."
             ),
+        })
 
     turns = 0
     consecutive_errors = 0
