@@ -273,6 +273,12 @@ def run_agent() -> tuple[bool, int]:
     stuck_success_redirects = 0
     wrote_since_success_reset = False
 
+    # Track whether the agent has attempted any file edits, to detect
+    # text-only responses before any work was done.
+    has_attempted_edit = False
+    text_only_redirects = 0
+    max_text_only_redirects = 2
+
     while turns < MAX_TURNS:
         turns += 1
         log(f"--- Turn {turns}/{MAX_TURNS} ---")
@@ -300,6 +306,28 @@ def run_agent() -> tuple[bool, int]:
 
         # If the model produced a text response with no tool calls, it's done
         if choice.finish_reason == "stop" or not choice.message.tool_calls:
+            # Redirect text-only responses when no edits have been made yet
+            if not has_attempted_edit and text_only_redirects < max_text_only_redirects:
+                text_only_redirects += 1
+                log(
+                    f"Agent returned text-only without making any edits "
+                    f"(redirect {text_only_redirects}/{max_text_only_redirects}). "
+                    f"Injecting redirect."
+                )
+                messages.append({
+                    "role": "assistant",
+                    "content": choice.message.content or "",
+                })
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "You have not made any code changes yet. Do not respond with "
+                        "text only - you must use your tools to explore the repository, "
+                        "make the necessary edits with edit_file or write_file, and commit "
+                        "your changes with git. Start now by calling a tool."
+                    ),
+                })
+                continue
             if choice.message.content:
                 log(f"Agent finished: {choice.message.content[:200]}")
             else:
@@ -324,6 +352,7 @@ def run_agent() -> tuple[bool, int]:
 
             # Any edit/write call breaks the "read loop that never writes" signal.
             if fn_name in ("edit_file", "write_file"):
+                has_attempted_edit = True
                 wrote_since_success_reset = True
 
             if result["is_error"]:
