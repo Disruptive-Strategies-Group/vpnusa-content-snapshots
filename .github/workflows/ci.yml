@@ -103,7 +103,7 @@ jobs:
             # Check 2: Require SET lock_timeout before any DDL statement
             # DDL statements: ALTER TABLE, DROP TABLE, CREATE INDEX, REINDEX, TRUNCATE, ALTER INDEX
             if grep -qiE '(ALTER\s+TABLE|DROP\s+TABLE|CREATE\s+INDEX|REINDEX|TRUNCATE|ALTER\s+INDEX)' "$f"; then
-              if ! grep -qi 'SET\s+lock_timeout' "$f"; then
+              if ! grep -qiE 'SET\s+lock_timeout' "$f"; then
                 echo "ERROR: $f contains DDL statements but no 'SET lock_timeout'."
                 echo " DDL without lock_timeout can hang indefinitely if a lock is held."
                 echo " Add 'SET lock_timeout = '30s';' (or similar) before any DDL statement."
