@@ -105,6 +105,17 @@ runs:
         sys.exit(1)
         PYEOF
 
+        # Wait for SSM data path to fully establish — the TCP listener
+        # accepts connections before the tunnel is ready to carry data
+        sleep 3
+
+    - name: Remove empty migration files
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Empty .sql files cause Flyway to error; remove them before migrating
+        find flyway/sql -name '*.sql' -empty -delete 2>/dev/null || true
+
     - name: Run Flyway migrate
       shell: bash
       env:
@@ -113,9 +124,25 @@ runs:
         FLYWAY_PASSWORD: "${{ inputs.db-password }}"
       run: |
         set -euo pipefail
-        flyway migrate \
-          -locations="filesystem:flyway/sql" \
-          -configFiles=flyway/flyway.conf
+        MAX_RETRIES=3
+        RETRY_DELAY=5
+        for attempt in $(seq 1 "$MAX_RETRIES"); do
+          echo "Flyway migrate attempt $attempt/$MAX_RETRIES"
+          if flyway migrate \
+            -locations="filesystem:flyway/sql" \
+            -configFiles=flyway/flyway.conf; then
+            echo "Flyway migrate succeeded on attempt $attempt"
+            break
+          else
+            rc=$?
+            if [ "$attempt" -eq "$MAX_RETRIES" ]; then
+              echo "ERROR: Flyway migrate failed after $MAX_RETRIES attempts (last exit code: $rc)"
+              exit "$rc"
+            fi
+            echo "Flyway migrate failed (exit $rc), retrying in ${RETRY_DELAY}s..."
+            sleep "$RETRY_DELAY"
+          fi
+        done
 
     - name: Tear down SSM tunnel
       if: always()
