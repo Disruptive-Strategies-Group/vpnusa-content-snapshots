@@ -280,19 +280,34 @@ def run_agent() -> tuple[bool, int]:
     text_only_redirects = 0
     max_text_only_redirects = 2
 
+    has_made_tool_call = False
+    tool_choice_required_failed = False
+
     while turns < MAX_TURNS:
         turns += 1
         log(f"--- Turn {turns}/{MAX_TURNS} ---")
+
+        # Force tool use after text-only redirects to break the
+        # "answers without tools" loop where the model returns text-only
+        # on every turn without ever calling a tool.
+        if text_only_redirects > 0 and not has_made_tool_call and not tool_choice_required_failed:
+            effective_tool_choice = "required"
+        else:
+            effective_tool_choice = "auto"
 
         try:
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 tools=TOOL_SCHEMAS,
-                tool_choice="auto",
+                tool_choice=effective_tool_choice,
                 temperature=0.0,
             )
         except Exception as e:
+            if effective_tool_choice == "required":
+                log(f"tool_choice='required' not supported ({e}), falling back to 'auto'")
+                tool_choice_required_failed = True
+                continue
             log(f"API call failed: {e}")
             consecutive_errors += 1
             if consecutive_errors >= max_consecutive_errors:
@@ -329,6 +344,12 @@ def run_agent() -> tuple[bool, int]:
                     ),
                 })
                 continue
+            # If the model never made any edits, return failure (not success)
+            # so the workflow correctly reports BLOCKED instead of masking
+            # the no-op as a successful run.
+            if not has_attempted_edit:
+                log("Agent returned text-only without making any edits (all redirects exhausted)")
+                return False, turns
             if choice.message.content:
                 log(f"Agent finished: {choice.message.content[:200]}")
             else:
@@ -338,6 +359,7 @@ def run_agent() -> tuple[bool, int]:
 
         # Process tool calls
         messages.append(choice.message.model_dump())
+        has_made_tool_call = True
 
         for tool_call in choice.message.tool_calls:
             fn_name = tool_call.function.name
