@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import sys
 import time
 
@@ -61,6 +62,19 @@ CONTEXT_BUDGET_CHARS = 180_000
 # loop can land on a different provider. Without this timeout a silent stall
 # (no response, no error) would hang the agent until the job-level timeout.
 API_REQUEST_TIMEOUT = 180.0
+
+# Per-turn wall clock timeout (seconds). Wraps the entire turn body — API call
+# plus tool execution — so no single turn can hang indefinitely regardless of
+# what stalls. Must exceed API_REQUEST_TIMEOUT to allow at least one full API
+# attempt before the alarm fires.
+TURN_WALL_CLOCK_TIMEOUT = 300  # 5 minutes
+
+class TurnTimeoutError(Exception):
+    """Raised when a single agentic turn exceeds TURN_WALL_CLOCK_TIMEOUT."""
+    pass
+
+def _turn_timeout_handler(signum, frame):
+    raise TurnTimeoutError(f"Turn exceeded {TURN_WALL_CLOCK_TIMEOUT}s wall clock")
 
 
 def log(msg: str) -> None:
@@ -247,7 +261,12 @@ def run_agent() -> tuple[bool, int]:
     system_prompt = build_system_prompt(issue_data)
     log(f"System prompt built ({len(system_prompt)} chars)")
 
-    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL, timeout=API_REQUEST_TIMEOUT)
+    client = OpenAI(
+        api_key=API_KEY,
+        base_url=API_BASE_URL,
+        timeout=API_REQUEST_TIMEOUT,
+        max_retries=0,
+    )
     log(f"Initialized API client: {API_BASE_URL} / model={MODEL}")
 
     messages: list[dict] = [
@@ -306,6 +325,9 @@ def run_agent() -> tuple[bool, int]:
         else:
             effective_tool_choice = "auto"
 
+        signal.signal(signal.SIGALRM, _turn_timeout_handler)
+        signal.alarm(TURN_WALL_CLOCK_TIMEOUT)
+
         try:
             response = client.chat.completions.create(
                 model=MODEL,
@@ -315,7 +337,18 @@ def run_agent() -> tuple[bool, int]:
                 temperature=0.0,
                 timeout=API_REQUEST_TIMEOUT,
             )
+        except TurnTimeoutError:
+            signal.alarm(0)
+            log(f"⚠ Turn {turns} exceeded {TURN_WALL_CLOCK_TIMEOUT}s wall clock timeout")
+            consecutive_errors += 1
+            if consecutive_errors >= max_consecutive_errors:
+                log(f"Max consecutive errors ({max_consecutive_errors}) reached, aborting")
+                return False, turns
+            log("Retrying in 5 seconds...")
+            time.sleep(5)
+            continue
         except Exception as e:
+            signal.alarm(0)
             if effective_tool_choice == "required":
                 log(f"tool_choice='required' not supported ({e}), falling back to 'auto'")
                 tool_choice_required_failed = True
@@ -328,6 +361,8 @@ def run_agent() -> tuple[bool, int]:
             log("Retrying in 5 seconds...")
             time.sleep(5)
             continue
+        finally:
+            signal.alarm(0)  # always cancel the alarm after the API attempt
 
         consecutive_errors = 0
         choice = response.choices[0]
