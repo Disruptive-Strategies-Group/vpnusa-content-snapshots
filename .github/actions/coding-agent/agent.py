@@ -133,6 +133,9 @@ WORKFLOW:
 5. Test your changes if appropriate (run linters, type checks, unit tests via bash).
 6. Commit all changes with a clear commit message referencing the issue number.
 
+LARGE FILE HANDLING:
+If read_file returns a truncated view of a file (you will see a TRUNCATED message), use grep_search to find the exact line numbers of the code you need to modify, then use read_file_lines to read that specific section. This is essential for files over 50,000 characters. If edit_file reports that old_text appears multiple times, use read_file_lines to read more surrounding context until you find a unique string that appears exactly once, then retry edit_file with that larger old_text. Never attempt edit_file on code you have not directly read — the old_text will not match and the edit will fail.
+
 TRIGGERING ISSUE (SOURCE OF TRUTH):
 Issue #: {issue_number}
 Title: {issue_title}
