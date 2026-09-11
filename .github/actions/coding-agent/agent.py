@@ -54,6 +54,14 @@ AGENT_REQUIRED_FILES = os.environ.get("AGENT_REQUIRED_FILES", "*")
 # this, _compact_messages() reclaims space (~45K tokens, approaching 64K limit).
 CONTEXT_BUDGET_CHARS = 180_000
 
+# Per-request timeout for the OpenAI client, in seconds. DeepSeek V4 Flash's
+# best-provider P50 latency is ~0.41s and even long tool-loaded prompts
+# complete well under a minute; anything past 3 minutes is almost certainly a
+# stalled OpenRouter provider connection worth aborting so the existing retry
+# loop can land on a different provider. Without this timeout a silent stall
+# (no response, no error) would hang the agent until the job-level timeout.
+API_REQUEST_TIMEOUT = 180.0
+
 
 def log(msg: str) -> None:
     print(f"[agent] {msg}", flush=True)
@@ -236,7 +244,7 @@ def run_agent() -> tuple[bool, int]:
     system_prompt = build_system_prompt(issue_data)
     log(f"System prompt built ({len(system_prompt)} chars)")
 
-    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
+    client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL, timeout=API_REQUEST_TIMEOUT)
     log(f"Initialized API client: {API_BASE_URL} / model={MODEL}")
 
     messages: list[dict] = [
@@ -302,6 +310,7 @@ def run_agent() -> tuple[bool, int]:
                 tools=TOOL_SCHEMAS,
                 tool_choice=effective_tool_choice,
                 temperature=0.0,
+                timeout=API_REQUEST_TIMEOUT,
             )
         except Exception as e:
             if effective_tool_choice == "required":
