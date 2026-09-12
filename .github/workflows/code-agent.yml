@@ -130,7 +130,7 @@ jobs:
     needs: [route]
     if: needs.route.outputs.mode == 'implement'
     runs-on: ubuntu-latest
-    timeout-minutes: 75
+    timeout-minutes: 30
     outputs:
       no_changes: ${{ steps.push.outputs.no_changes }}
       pre_push_branch_sha: ${{ steps.pre_push_sha.outputs.pre_push_branch_sha }}
@@ -320,6 +320,7 @@ jobs:
 
       - name: Agent implements approved plan (edit → commit only)
         id: claude
+        timeout-minutes: 20
         uses: ./.github/actions/coding-agent
         with:
           api-key: ${{ env.OPENROUTER_API_KEY }}
@@ -327,7 +328,7 @@ jobs:
           branch-name: ${{ env.BRANCH_NAME }}
           issue-number: ${{ env.ISSUE_NUMBER }}
           issue-title: ${{ env.ISSUE_TITLE }}
-          max-turns: "100"
+          max-turns: "75"
 
       - name: Safety net - commit working tree if Claude didn't
         id: autocommit
@@ -846,7 +847,7 @@ jobs:
           echo "pr_url=${PR_URL}" >> "$GITHUB_OUTPUT"
 
       - name: "Finalize: create or retitle PR after NEEDS-REVIEW"
-        if: ${{ needs.route.outputs.mode == 'implement' && needs.implement.outputs.no_changes != 'true' && steps.existing_pr.outputs.pr_url == '' }}
+        if: ${{ needs.route.outputs.mode == 'implement' && needs.implement.result == 'success' && needs.implement.outputs.no_changes != 'true' && steps.existing_pr.outputs.pr_url == '' }}
         shell: bash
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
