@@ -81,6 +81,43 @@ def log(msg: str) -> None:
     print(f"[agent] {msg}", flush=True)
 
 
+def _extract_error_signature(tool_result_text: str) -> str | None:
+    """Normalize common import/mock error patterns from tool output.
+
+    Returns a stable signature string used by the repeated-error-loop
+    detector, or None when the text matches no known pattern:
+
+      - ImportError: <module_name>                          -> import:<module_name>
+      - ModuleNotFoundError: <module_name>                  -> import:<module_name>
+      - AttributeError: module '<x>' has no attribute '<y>' -> attr:<x>.<y>
+      - TypeError: ... argument '<name>' ...                -> typearg:<name>
+    """
+    if not tool_result_text:
+        return None
+    text = tool_result_text.strip()
+    # ModuleNotFoundError: No module named 'pandas'
+    m = re.search(
+        r"(?:ImportError|ModuleNotFoundError):\s*No module named\s+'([^']+)'",
+        text,
+    )
+    if m:
+        return f"import:{m.group(1)}"
+    # ImportError: numpy / ModuleNotFoundError: numpy
+    m = re.search(r"(?:ImportError|ModuleNotFoundError):\s*([A-Za-z_][\w.]*)", text)
+    if m:
+        return f"import:{m.group(1)}"
+    m = re.search(
+        r"AttributeError:\s*module\s+'([^']+)'\s+has no attribute\s+'([^']+)'",
+        text,
+    )
+    if m:
+        return f"attr:{m.group(1)}.{m.group(2)}"
+    m = re.search(r"TypeError:.*?argument\s*:?\s+'([^']+)'", text)
+    if m:
+        return f"typearg:{m.group(1)}"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Issue context loading
 # ---------------------------------------------------------------------------
@@ -139,6 +176,8 @@ HARD REQUIREMENTS:
 - Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages.
 - NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
 
+STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
+
 WORKFLOW:
 1. Read the issue and the approved plan carefully.
 2. Explore the repository structure to understand the codebase (use list_files, read_file, grep_search).
@@ -171,6 +210,8 @@ HARD REQUIREMENTS:
 - Do not modify .claude/ directory.
 - Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages.
 - NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
+
+STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
 
 WORKFLOW:
 1. Run `git diff origin/main...HEAD` to understand what this branch has changed.
@@ -303,6 +344,13 @@ def run_agent() -> tuple[bool, int]:
     repeated_success_sigs: list[str] = []
     stuck_success_redirects = 0
     wrote_since_success_reset = False
+
+    # Import/mock error-loop detection: track normalized error signatures from
+    # tool output (see _extract_error_signature) for the pivot/hard-stop
+    # triggers. Initialized once per run.
+    error_signature_counts: dict[str, int] = {}
+    error_signature_turns: list[tuple[int, str]] = []
+    pivoted_error_signatures: set[str] = set()
 
     # Track whether the agent has attempted any file edits, to detect
     # text-only responses before any work was done.
@@ -447,6 +495,48 @@ def run_agent() -> tuple[bool, int]:
                 else:
                     repeated_success_sigs = [sig]
                     wrote_since_success_reset = False
+
+            # Import/mock error-loop detection: check point runs after each
+            # tool result, before appending to messages.
+            err_sig = _extract_error_signature(result["output"])
+            if err_sig:
+                error_signature_counts[err_sig] = error_signature_counts.get(err_sig, 0) + 1
+                error_signature_turns.append((turns, err_sig))
+                count = error_signature_counts[err_sig]
+
+                # Pivot trigger: 3 occurrences of the same signature within a
+                # rolling 6-turn window -> inject a system-role redirect
+                # (fires exactly once per signature).
+                if count >= 3 and err_sig not in pivoted_error_signatures:
+                    recent_turns = [t for t, s in error_signature_turns if s == err_sig]
+                    if len(recent_turns) >= 3 and (turns - recent_turns[-3]) <= 6:
+                        pivoted_error_signatures.add(err_sig)
+                        log(
+                            f"WARNING: Repeated error signature {err_sig} "
+                            f"({count} occurrences in 6 turns). Injecting pivot redirect."
+                        )
+                        messages.append({
+                            "role": "system",
+                            "content": (
+                                "SYSTEM: You keep hitting the same import/mock error "
+                                f"({err_sig}). Read the actual source file and copy its "
+                                "imports exactly, or commit a SKIP.md explaining why this "
+                                "cannot be done and end your turn."
+                            ),
+                        })
+
+                # Hard-stop trigger: 5 occurrences of the same signature within
+                # a rolling 10-turn window -> exit with a distinct code so the
+                # workflow surfaces ROOT_CAUSE: repeated_error_loop:<signature>.
+                # Does NOT consume remaining max_turns.
+                if count >= 5:
+                    recent_turns = [t for t, s in error_signature_turns if s == err_sig]
+                    if len(recent_turns) >= 5 and (turns - recent_turns[-5]) <= 10:
+                        log(
+                            f"Repeated error loop detected for signature {err_sig} "
+                            f"({count} occurrences in 10 turns), aborting"
+                        )
+                        sys.exit(3)
 
             messages.append(
                 {
