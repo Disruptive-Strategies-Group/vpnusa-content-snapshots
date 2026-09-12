@@ -69,6 +69,16 @@ API_REQUEST_TIMEOUT = 180.0
 # attempt before the alarm fires.
 TURN_WALL_CLOCK_TIMEOUT = 300  # 5 minutes
 
+# No-progress detection: hard-stop when the agent burns too many turns without
+# any edit_file/write_file call (e.g. an endless successful-but-non-writing
+# exploration loop of bash awk/sed/od-style byte inspections). The agent gets
+# NO_PROGRESS_GRACE_TURNS of exploration before the detector arms; once past
+# that, sys.exit(4) fires when turns_since_last_write reaches
+# NO_PROGRESS_THRESHOLD. Exit code 4 is distinct from exit code 3 (error-loop
+# detection) so the workflow can surface ROOT_CAUSE: no_progress.
+NO_PROGRESS_THRESHOLD = 15
+NO_PROGRESS_GRACE_TURNS = 20
+
 class TurnTimeoutError(Exception):
     """Raised when a single agentic turn exceeds TURN_WALL_CLOCK_TIMEOUT."""
     pass
@@ -358,11 +368,17 @@ def run_agent() -> tuple[bool, int]:
     text_only_redirects = 0
     max_text_only_redirects = 2
 
+    # No-progress detection: turns since the last edit_file/write_file call.
+    # Resets to 0 on any write; hard-stops with sys.exit(4) once the grace
+    # period has passed and the counter reaches NO_PROGRESS_THRESHOLD.
+    turns_since_last_write = 0
+
     has_made_tool_call = False
     tool_choice_required_failed = False
 
     while turns < MAX_TURNS:
         turns += 1
+        turns_since_last_write += 1
         log(f"--- Turn {turns}/{MAX_TURNS} ---")
 
         # Force tool use after text-only redirects to break the
@@ -472,6 +488,7 @@ def run_agent() -> tuple[bool, int]:
             if fn_name in ("edit_file", "write_file"):
                 has_attempted_edit = True
                 wrote_since_success_reset = True
+                turns_since_last_write = 0
 
             if result["is_error"]:
                 log(f"  Error: {result['output'][:200]}")
@@ -610,6 +627,21 @@ def run_agent() -> tuple[bool, int]:
             repeated_success_sigs = []
             wrote_since_success_reset = False
             log(f"Success-loop redirect injected (attempt {stuck_success_redirects}/2)")
+
+        # No-progress detection: hard-stop when the agent burns too many turns
+        # without any edit_file/write_file call. Fires only after the grace
+        # period so early exploration turns are not penalized. Exit code 4 is
+        # distinct from exit code 3 (error-loop) so the workflow can surface
+        # ROOT_CAUSE: no_progress.
+        if (
+            turns > NO_PROGRESS_GRACE_TURNS
+            and turns_since_last_write >= NO_PROGRESS_THRESHOLD
+        ):
+            log(
+                f"No progress detected: {turns_since_last_write} turns since last "
+                f"edit_file/write_file (threshold {NO_PROGRESS_THRESHOLD}), aborting"
+            )
+            sys.exit(4)
 
         # Context window management: if messages are getting very large,
         # summarize older tool results to stay within limits
