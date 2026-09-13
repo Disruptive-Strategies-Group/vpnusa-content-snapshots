@@ -76,8 +76,8 @@ TURN_WALL_CLOCK_TIMEOUT = 300  # 5 minutes
 # that, sys.exit(4) fires when turns_since_last_write reaches
 # NO_PROGRESS_THRESHOLD. Exit code 4 is distinct from exit code 3 (error-loop
 # detection) so the workflow can surface ROOT_CAUSE: no_progress.
-NO_PROGRESS_THRESHOLD = 15
-NO_PROGRESS_GRACE_TURNS = 20
+NO_PROGRESS_THRESHOLD = 25
+NO_PROGRESS_GRACE_TURNS = 30
 
 class TurnTimeoutError(Exception):
     """Raised when a single agentic turn exceeds TURN_WALL_CLOCK_TIMEOUT."""
@@ -651,6 +651,12 @@ def run_agent() -> tuple[bool, int]:
         if total_chars > CONTEXT_BUDGET_CHARS:
             log(f"Context approaching limit ({total_chars} chars), compacting...")
             messages = _compact_messages(messages)
+            # Reset no-progress counter: compaction drops tool results and forces the
+            # agent to re-read files it had already read. Those recovery turns are
+            # legitimate work, not agent inactivity, and must not count toward the
+            # no-progress hard-stop.
+            turns_since_last_write = 0
+            log("No-progress counter reset after compaction")
 
     log(f"Hit max_turns limit ({MAX_TURNS})")
     return False, turns
