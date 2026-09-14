@@ -646,32 +646,53 @@ jobs:
           verify_conclusion="${{ steps.verify.conclusion }}"
           push_conclusion="${{ steps.push.conclusion }}"
           if [ "$claude_conclusion" = "failure" ]; then
+            agent_exit="${{ steps.claude.outputs.exit-code }}"
             last_log="$(tail -100 /tmp/agent-stdout.log 2>/dev/null || true)"
-            if echo "$last_log" | grep -q "Hit max_turns"; then
-              reason="max_turns"
-              detail="$(echo "$last_log" | grep 'Hit max_turns' | tail -1)"
-            elif echo "$last_log" | grep -q "No progress detected"; then
-              reason="no_progress"
-              detail="$(echo "$last_log" | grep 'No progress detected' | tail -1)"
-            elif echo "$last_log" | grep -q "Repeated error loop"; then
-              reason="error_loop"
-              detail="$(echo "$last_log" | grep 'Repeated error loop' | tail -1)"
-            elif echo "$last_log" | grep -q "Agent stuck in"; then
-              reason="stuck_loop"
-              detail="$(echo "$last_log" | grep 'Agent stuck in' | tail -1)"
-            elif echo "$last_log" | grep -q "The action has timed out"; then
-              reason="wall_clock_timeout"
-              detail="Implement step exceeded its timeout-minutes budget"
-            else
-              reason="agent_error"
-              detail="$(echo "$last_log" | tail -3 | head -3)"
-            fi
+            case "$agent_exit" in
+              3)
+                reason="error_loop"
+                detail="$(echo "$last_log" | grep -E 'Repeated error loop|Error signature' | tail -3)"
+                ;;
+              4)
+                reason="no_progress"
+                detail="$(echo "$last_log" | grep -E 'No progress detected|Turns since last write' | tail -3)"
+                ;;
+              *)
+                # Fall back to existing string-based fingerprints for reasons agent.py can't distinguish by code
+                if echo "$last_log" | grep -q "Hit max_turns"; then
+                  reason="max_turns"
+                  detail="$(echo "$last_log" | grep 'Hit max_turns' | tail -1)"
+                elif echo "$last_log" | grep -q "Agent stuck in"; then
+                  reason="stuck_loop"
+                  detail="$(echo "$last_log" | grep 'Agent stuck in' | tail -1)"
+                elif echo "$last_log" | grep -q "The action has timed out"; then
+                  reason="wall_clock_timeout"
+                  detail="Implement step exceeded its timeout-minutes budget"
+                else
+                  reason="agent_error"
+                  # Now that /tmp/agent-stdout.log is populated, this actually returns useful content
+                  detail="$(echo "$last_log" | tail -10)"
+                fi
+                ;;
+            esac
           elif [ "$sanitize_conclusion" = "failure" ] || [ "$verify_conclusion" = "failure" ]; then
             reason="sanitize_failed"
             detail="Commit messages contained forbidden CI-skip markers; sanitization step could not rewrite them cleanly. Check commit messages and remove [skip ci] / [ci skip] / [no ci] / [skip actions] / skip-checks: true."
           elif [ "$push_conclusion" = "failure" ]; then
             reason="push_failed"
             detail="Push to remote branch failed — possible force-with-lease conflict or credentials issue."
+          elif [ "$claude_conclusion" = "success" ] && [ "${{ steps.push.outputs.no_changes }}" = "true" ]; then
+            # Agent exited clean but produced no file changes. Two sub-cases:
+            #   a) The requested change is already on main → surface that plainly.
+            #   b) Agent chose to stop without making edits → surface its final message.
+            last_log="$(tail -50 /tmp/agent-stdout.log 2>/dev/null || true)"
+            if echo "$last_log" | grep -qiE "already (in place|correct|satisfied|matches|on main)|no changes? (needed|required)|task (is )?already (complete|done)"; then
+              reason="already_on_main"
+              detail="Change already on main — agent inspected the anchor file(s) and found the requested state already present. Close the issue, or revise the plan if a different change is intended."
+            else
+              reason="no_changes_produced"
+              detail="Agent completed without editing any files. Last agent output:$(echo; echo "$last_log" | tail -10)"
+            fi
           fi
           {
             echo "failure_reason=${reason}"
@@ -814,9 +835,12 @@ jobs:
               if (implementResult === 'success' && noChanges) {
                 const newTitle = RED + ' [AGENT:BLOCKED] ' + stripAllPrefixes(currentTitle);
                 try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
+                const topLine = failureReason === 'already_on_main'
+                  ? 'Agent found the requested change already on `main`.'
+                  : 'Agent approval run produced no code changes and no PR.';
                 await github.rest.issues.createComment({
                   owner, repo, issue_number,
-                  body: `<!-- AGENT_BLOCKED -->\nAgent approval run produced no code changes and no PR.\n\nRoot cause: **${failureReason}**\n\nDetail:\n\`\`\`\n${failureDetail}\n\`\`\`\n\nPlease adjust the issue and comment \`/agent approve\` again.\n\nFull workflow log: [${runUrl}](${runUrl})\n\nStatus: AGENT:BLOCKED`
+                  body: `<!-- AGENT_BLOCKED -->\n${topLine}\n\nRoot cause: **${failureReason}**\n\nDetail:\n\`\`\`\n${failureDetail}\n\`\`\`\n\nPlease adjust the issue and comment \`/agent approve\` again.\n\nFull workflow log: [${runUrl}](${runUrl})\n\nStatus: AGENT:BLOCKED`
                 });
                 return;
               }
