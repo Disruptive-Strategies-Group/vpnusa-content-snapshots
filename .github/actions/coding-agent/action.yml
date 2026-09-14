@@ -84,4 +84,4 @@ runs:
       run: |
         set -euo pipefail
         export PYTHONPATH="${{ github.action_path }}"
-        python3 "${{ github.action_path }}/agent.py"
+        python3 "${{ github.action_path }}/agent.py" > /tmp/agent-stdout.log 2>&1
