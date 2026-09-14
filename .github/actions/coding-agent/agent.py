@@ -183,7 +183,7 @@ HARD REQUIREMENTS:
 - If no code changes are required, do NOT commit.
 - Do not modify .github/workflows unless the issue explicitly requires it.
 - Do not modify .claude/ directory.
-- Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages.
+- Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages. The git commit hook will REJECT any commit message containing these markers. If your commit fails with 'forbidden CI-skip marker', remove the marker and retry — do not force-add it.
 - NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
 
 STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
@@ -218,7 +218,7 @@ HARD REQUIREMENTS:
 - You MUST commit your changes locally (git commit). Do NOT push. Do NOT open a PR.
 - Do not modify .github/workflows unless the review concerns explicitly require it.
 - Do not modify .claude/ directory.
-- Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages.
+- Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages. The git commit hook will REJECT any commit message containing these markers. If your commit fails with 'forbidden CI-skip marker', remove the marker and retry — do not force-add it.
 - NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
 
 STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
