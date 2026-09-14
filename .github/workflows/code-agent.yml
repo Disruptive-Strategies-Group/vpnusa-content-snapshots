@@ -137,6 +137,8 @@ jobs:
       post_push_branch_sha: ${{ steps.post_push_sha.outputs.post_push_branch_sha }}
       branch_advanced: ${{ steps.branch_advanced.outputs.branch_advanced }}
       pr_url: ${{ steps.pr.outputs.pr_url }}
+      failure_reason: ${{ steps.classify.outputs.failure_reason }}
+      failure_detail: ${{ steps.classify.outputs.failure_detail }}
     env:
       DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
       ISSUE_NUMBER: ${{ needs.route.outputs.issue_number }}
@@ -270,6 +272,23 @@ jobs:
             echo "Created new issue branch from ${DEFAULT_BRANCH}."
           fi
 
+          # Install a commit-msg hook that rejects forbidden CI-skip markers.
+          # This gives the agent immediate, clear feedback at commit time so the
+          # sanitize step below is only needed as a defense-in-depth fallback.
+          mkdir -p .git/hooks
+          cat > .git/hooks/commit-msg <<'HOOK'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          MSG=$(cat "$1")
+          if echo "$MSG" | grep -iqE '\[(skip[[:space:]]+ci|ci[[:space:]]+skip|no[[:space:]]+ci|skip[[:space:]]+actions)\]|skip-checks:[[:space:]]*true'; then
+            echo "ERROR: Commit message contains a forbidden CI-skip marker."
+            echo "Remove [skip ci] / [ci skip] / [no ci] / [skip actions] / skip-checks: true from the message."
+            exit 1
+          fi
+          HOOK
+          chmod +x .git/hooks/commit-msg
+          echo "Installed commit-msg hook to reject CI-skip markers."
+
       - name: Capture remote issue branch SHA before implementation
         id: pre_push_sha
         shell: bash
@@ -317,6 +336,9 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --json title,body,comments \
             > .agent/issue-context.json
+
+      - name: Prepare agent stdout log
+        run: touch /tmp/agent-stdout.log
 
       - name: Agent implements approved plan (edit → commit only)
         id: claude
@@ -436,6 +458,7 @@ jobs:
           fi
 
       - name: Sanitize CI-skip markers from agent branch commits
+        id: sanitize
         if: always() && !cancelled()
         shell: bash
         run: |
@@ -470,48 +493,28 @@ jobs:
           else
             echo "Sanitizing commit messages (branch-scoped only)..."
 
-            # Save current branch name
-            original_branch="${BRANCH_NAME}"
-
-            # Create a new branch from the base
-            temp_branch="temp-sanitize-$$-$(date +%s)-${RANDOM}"
-            git checkout -b "${temp_branch}" "origin/${DEFAULT_BRANCH}"
-
-            # Cherry-pick each commit, sanitizing messages as needed
-            for commit in "${commits[@]}"; do
-              # Get original commit message BEFORE cherry-pick
-              original_msg=$(git show -s --format='%B' "${commit}")
-
-              if ! git cherry-pick "${commit}" --no-commit 2>/dev/null; then
-                echo "BLOCKER: Cherry-pick failed for commit ${commit:0:8}"
-                git cherry-pick --abort 2>/dev/null || true
-                exit 1
-              fi
-
-              # Sanitize the message
-              sanitized_msg=$(echo "${original_msg}" | perl -pe 's/\[(skip\s+ci|ci\s+skip|no\s+ci|skip\s+actions)\]//gi; s/skip-checks:\s*true//gi; s/  +/ /g; s/^\s+//; s/\s+$//')
-
-              # Ensure message is not empty after sanitization
-              if [ -z "${sanitized_msg}" ]; then
-                sanitized_msg="chore: sanitized commit (original message contained only CI-skip markers)"
-              fi
-
-              # Commit with sanitized message
-              if ! git commit --allow-empty -m "${sanitized_msg}"; then
-                echo "BLOCKER: Failed to commit sanitized message for ${commit:0:8}"
-                exit 1
-              fi
-            done
-
-            # Replace original branch with sanitized version
-            git branch -f "${original_branch}" HEAD
-            git checkout "${original_branch}"
-            git branch -D "${temp_branch}"
+            # Use filter-branch --msg-filter: only messages are rewritten, so no
+            # tree operations occur and no cherry-pick conflicts are possible.
+            cat > /tmp/sanitize-msg.pl <<'PERL'
+            $m = join("", <>);
+            $m =~ s/\[(skip\s+ci|ci\s+skip|no\s+ci|skip\s+actions)\]//gi;
+            $m =~ s/skip-checks:\s*true//gi;
+            $m =~ s/  +/ /g;
+            $m =~ s/^\s+//;
+            $m =~ s/\s+$//;
+            if ($m =~ /^\s*$/) {
+              $m = "chore: sanitized commit (original message contained only CI-skip markers)\n";
+            }
+            print $m;
+          PERL
+            git filter-branch -f --msg-filter 'perl /tmp/sanitize-msg.pl' "origin/${DEFAULT_BRANCH}..HEAD"
+            rm -f /tmp/sanitize-msg.pl
 
             echo "Sanitization complete."
           fi
 
       - name: Verify no CI-skip markers remain
+        id: verify
         if: always() && !cancelled()
         shell: bash
         run: |
@@ -631,6 +634,52 @@ jobs:
             echo "No PR hint found for ${BRANCH_NAME}; finalize must re-resolve authoritatively before create/edit."
           fi
 
+      - name: Classify failure for finalize
+        if: always()
+        id: classify
+        shell: bash
+        run: |
+          reason=""
+          detail=""
+          claude_conclusion="${{ steps.claude.conclusion }}"
+          sanitize_conclusion="${{ steps.sanitize.conclusion }}"
+          verify_conclusion="${{ steps.verify.conclusion }}"
+          push_conclusion="${{ steps.push.conclusion }}"
+          if [ "$claude_conclusion" = "failure" ]; then
+            last_log="$(tail -100 /tmp/agent-stdout.log 2>/dev/null || true)"
+            if echo "$last_log" | grep -q "Hit max_turns"; then
+              reason="max_turns"
+              detail="$(echo "$last_log" | grep 'Hit max_turns' | tail -1)"
+            elif echo "$last_log" | grep -q "No progress detected"; then
+              reason="no_progress"
+              detail="$(echo "$last_log" | grep 'No progress detected' | tail -1)"
+            elif echo "$last_log" | grep -q "Repeated error loop"; then
+              reason="error_loop"
+              detail="$(echo "$last_log" | grep 'Repeated error loop' | tail -1)"
+            elif echo "$last_log" | grep -q "Agent stuck in"; then
+              reason="stuck_loop"
+              detail="$(echo "$last_log" | grep 'Agent stuck in' | tail -1)"
+            elif echo "$last_log" | grep -q "The action has timed out"; then
+              reason="wall_clock_timeout"
+              detail="Implement step exceeded its timeout-minutes budget"
+            else
+              reason="agent_error"
+              detail="$(echo "$last_log" | tail -3 | head -3)"
+            fi
+          elif [ "$sanitize_conclusion" = "failure" ] || [ "$verify_conclusion" = "failure" ]; then
+            reason="sanitize_failed"
+            detail="Commit messages contained forbidden CI-skip markers; sanitization step could not rewrite them cleanly. Check commit messages and remove [skip ci] / [ci skip] / [no ci] / [skip actions] / skip-checks: true."
+          elif [ "$push_conclusion" = "failure" ]; then
+            reason="push_failed"
+            detail="Push to remote branch failed — possible force-with-lease conflict or credentials issue."
+          fi
+          {
+            echo "failure_reason=${reason}"
+            echo "failure_detail<<EOF"
+            echo "${detail}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
   finalize:
     name: finalize
     needs: [route, implement]
@@ -652,6 +701,8 @@ jobs:
       PRE_PUSH_BRANCH_SHA: ${{ needs.implement.outputs.pre_push_branch_sha }}
       POST_PUSH_BRANCH_SHA: ${{ needs.implement.outputs.post_push_branch_sha }}
       BRANCH_ADVANCED: ${{ needs.implement.outputs.branch_advanced }}
+      FAILURE_REASON: ${{ needs.implement.outputs.failure_reason }}
+      FAILURE_DETAIL: ${{ needs.implement.outputs.failure_detail }}
 
     steps:
       - name: Generate GitHub App token
@@ -748,6 +799,9 @@ jobs:
             const prePushBranchSha = process.env.PRE_PUSH_BRANCH_SHA || '';
             const postPushBranchSha = process.env.POST_PUSH_BRANCH_SHA || '';
             const branchAdvanced = (process.env.BRANCH_ADVANCED || "") === "true";
+            const failureReason = process.env.FAILURE_REASON || "unknown";
+            const failureDetail = process.env.FAILURE_DETAIL || "No detail available.";
+            const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
 
             if (mode === 'plan' || mode === 'revise-plan') {
               // Plan generation is now handled by the Lambda (processPlanGeneration).
@@ -762,7 +816,7 @@ jobs:
                 try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
                 await github.rest.issues.createComment({
                   owner, repo, issue_number,
-                  body: `<!-- AGENT_BLOCKED -->\nAgent approval run produced no code changes and no PR.\n\nPlease adjust the issue and comment \`/agent approve\` again.\n\nStatus: AGENT:BLOCKED`
+                  body: `<!-- AGENT_BLOCKED -->\nAgent approval run produced no code changes and no PR.\n\nRoot cause: **${failureReason}**\n\nDetail:\n\`\`\`\n${failureDetail}\n\`\`\`\n\nPlease adjust the issue and comment \`/agent approve\` again.\n\nFull workflow log: [${runUrl}](${runUrl})\n\nStatus: AGENT:BLOCKED`
                 });
                 return;
               }
@@ -795,7 +849,7 @@ jobs:
                 try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
                 await github.rest.issues.createComment({
                   owner, repo, issue_number,
-                  body: `<!-- AGENT_BLOCKED -->\nAgent hit the turn limit. Partial work has been committed to \`${process.env.BRANCH_NAME}\`. Comment \`/agent approve\` to continue from the current branch state.\n\nStatus: AGENT:BLOCKED`
+                  body: `<!-- AGENT_BLOCKED -->\nAgent hit the turn limit. Partial work has been committed to \`${process.env.BRANCH_NAME}\`. Comment \`/agent approve\` to continue from the current branch state.\n\nRoot cause: **${failureReason}**\n\nDetail:\n\`\`\`\n${failureDetail}\n\`\`\`\n\nFull workflow log: [${runUrl}](${runUrl})\n\nStatus: AGENT:BLOCKED`
                 });
                 return;
               }
@@ -804,7 +858,7 @@ jobs:
               try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
               await github.rest.issues.createComment({
                 owner, repo, issue_number,
-                body: `<!-- AGENT_BLOCKED -->\nAgent implementation run failed or did not produce the expected output.\n\nFor planning changes, comment \`/agent revise\`.\nFor implementation after approval, comment \`/agent approve\`.\n\nStatus: AGENT:BLOCKED`
+                body: `<!-- AGENT_BLOCKED -->\nAgent run failed. Root cause: **${failureReason}**\n\nDetail:\n\`\`\`\n${failureDetail}\n\`\`\`\n\nFull workflow log: [${runUrl}](${runUrl})\nFor planning changes, comment \`/agent revise\`.\nFor implementation after approval, comment \`/agent approve\`.\n\nStatus: AGENT:BLOCKED`
               });
               return;
             }
@@ -814,7 +868,7 @@ jobs:
 
             await github.rest.issues.createComment({
               owner, repo, issue_number,
-              body: '<!-- AGENT_BLOCKED -->\nAgent finalize run reached an unexpected state.\n\nPlease inspect the workflow and re-run from the issue once corrected.\n\nStatus: AGENT:BLOCKED'
+              body: '<!-- AGENT_BLOCKED -->\nAgent finalize run reached an unexpected state.\n\nRoot cause: **' + failureReason + '**\n\nDetail:\n```\n' + failureDetail + '\n```\n\nPlease inspect the workflow and re-run from the issue once corrected.\n\nFull workflow log: [' + runUrl + '](' + runUrl + ')\n\nStatus: AGENT:BLOCKED'
             });
 
       - name: Check for existing PR on branch
