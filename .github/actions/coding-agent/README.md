@@ -11,7 +11,7 @@ A composite GitHub Action that runs an LLM-powered coding agent inside a workflo
 | `branch-name` | Git branch the agent is working on. | — | yes |
 | `issue-number` | GitHub issue number for commit messages. | — | yes |
 | `issue-title` | GitHub issue title for commit messages. | `""` | no |
-| `max-turns` | Maximum number of agentic loop iterations. | `"40"` | no |
+| `max-turns` | Maximum number of agentic loop iterations. | `"120"` | no |
 | `model` | Model identifier (e.g. deepseek/deepseek-v4-flash-0731, gpt-4o). | `"deepseek/deepseek-v4-flash-0731"` | no |
 | `api-base-url` | Base URL for the OpenAI-compatible API. | `"https://openrouter.ai/api/v1"` | no |
 | `mode` | `implement` or `revise`. In `revise` mode the agent addresses review concerns instead of implementing a plan. | `"implement"` | no |
