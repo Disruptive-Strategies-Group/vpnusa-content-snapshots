@@ -554,7 +554,7 @@ jobs:
           printf '%s\n' "${CHANGED}"
 
           # Extract search terms from the Gate 1 feedback: any quoted tokens
-          # (e.g. "fpc", "FPC", "604860202807") become an alternation pattern
+          # (e.g. security-sensitive tokens) become an alternation pattern
           # used to test whether a flagged file still contains the problematic
           # content. If no quoted terms exist, the pattern stays empty and the
           # revision is treated as substantive (no indefinite blocking).
