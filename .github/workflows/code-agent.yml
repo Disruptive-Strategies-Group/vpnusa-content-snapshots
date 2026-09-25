@@ -833,11 +833,21 @@ jobs:
 
             if (mode === 'implement') {
               if (implementResult === 'success' && noChanges) {
+                if (failureReason === 'already_on_main') {
+                  // The requested change is already on the default branch (the issue's PR was
+                  // merged by a prior run, or the change landed via another PR). Do NOT flip the
+                  // title to BLOCKED and do NOT post an AGENT:BLOCKED comment — the issue is
+                  // effectively complete. Post a neutral informational note only.
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number,
+                    body: `The requested change is already on \`${github.context.payload.repository.default_branch}\`. No action needed.`
+                  });
+                  return;
+                }
+
                 const newTitle = RED + ' [AGENT:BLOCKED] ' + stripAllPrefixes(currentTitle);
                 try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
-                const topLine = failureReason === 'already_on_main'
-                  ? 'Agent found the requested change already on `main`.'
-                  : 'Agent approval run produced no code changes and no PR.';
+                const topLine = 'Agent approval run produced no code changes and no PR.';
                 await github.rest.issues.createComment({
                   owner, repo, issue_number,
                   body: `<!-- AGENT_BLOCKED -->\n${topLine}\n\nRoot cause: **${failureReason}**\n\nDetail:\n\`\`\`\n${failureDetail}\n\`\`\`\n\nPlease adjust the issue and comment \`/agent approve\` again.\n\nFull workflow log: [${runUrl}](${runUrl})\n\nStatus: AGENT:BLOCKED`
