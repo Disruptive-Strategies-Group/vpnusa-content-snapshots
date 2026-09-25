@@ -12,7 +12,7 @@ Environment variables (set by the composite action):
     AGENT_BRANCH_NAME     — Git branch to work on
     AGENT_ISSUE_NUMBER    — GitHub issue number
     AGENT_ISSUE_TITLE     — GitHub issue title
-    AGENT_MAX_TURNS       — Max agentic loop iterations (default: 40)
+    AGENT_MAX_TURNS       — Max agentic loop iterations (default: 120)
     AGENT_MODE            — implement | revise (default: implement)
     AGENT_REVIEW_CONCERNS — Review concerns text (revise mode)
     AGENT_REQUIRED_FILES  — JSON-encoded array of file paths the agent must
@@ -46,7 +46,7 @@ ISSUE_CONTEXT_PATH = os.environ["AGENT_ISSUE_CONTEXT"]
 BRANCH_NAME = os.environ["AGENT_BRANCH_NAME"]
 ISSUE_NUMBER = os.environ["AGENT_ISSUE_NUMBER"]
 ISSUE_TITLE = os.environ.get("AGENT_ISSUE_TITLE", "")
-MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "40"))
+MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "120"))
 AGENT_MODE = os.environ.get("AGENT_MODE", "implement")
 AGENT_REVIEW_CONCERNS = os.environ.get("AGENT_REVIEW_CONCERNS", "")
 AGENT_REQUIRED_FILES = os.environ.get("AGENT_REQUIRED_FILES", "*")
@@ -656,7 +656,15 @@ def run_agent() -> tuple[bool, int]:
             # legitimate work, not agent inactivity, and must not count toward the
             # no-progress hard-stop.
             turns_since_last_write = 0
-            log("No-progress counter reset after compaction")
+            # Also clear the success-repetition-loop tracker. Compaction drops
+            # tool results and forces the agent to re-read files it had already
+            # read; those recovery re-reads are legitimate work and must not be
+            # misclassified as a "success repetition loop" that triggers a
+            # spurious BLOCKED abort.
+            repeated_success_sigs = []
+            wrote_since_success_reset = False
+            stuck_success_redirects = 0
+            log("No-progress and success-loop trackers reset after compaction")
 
     log(f"Hit max_turns limit ({MAX_TURNS})")
     return False, turns
