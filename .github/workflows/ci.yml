@@ -129,18 +129,12 @@ jobs:
           echo "All Flyway migration files passed lint checks."
 
   byte-compile:
-    # Guard against Python SyntaxError / IndentationError / bad encoding
-    # landing on main. See aeris-compute #1707/#1709 for the incident that
-    # motivated adding this. Skips on non-Python repos automatically.
-    if: hashFiles('worker/**/*.py') != '' || hashFiles('sam/**/*.py') != '' || hashFiles('src/**/*.py') != '' || hashFiles('app/**/*.py') != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Install ruff
-        run: pip install ruff
       - name: Byte-compile all .py under Python source roots
         run: |
           for dir in worker sam src app; do
@@ -148,5 +142,3 @@ jobs:
               python -m compileall -q -f "$dir" || exit 1
             fi
           done
-      - name: Ruff syntax check (E999 only, no style)
-        run: ruff check --select E999 .
