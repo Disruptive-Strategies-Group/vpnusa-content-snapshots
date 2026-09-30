@@ -8,6 +8,7 @@ Environment variables (set by the composite action):
     AGENT_API_KEY         — API key for the LLM provider
     AGENT_API_BASE_URL    — Base URL (default: https://openrouter.ai/api/v1)
     AGENT_MODEL           — Model name (default: deepseek/deepseek-v4-flash-0731)
+    AGENT_ESCALATION_MODEL — Model to escalate to on no_progress (default: deepseek/deepseek-v4-pro)
     AGENT_ISSUE_CONTEXT   — Path to .agent/issue-context.json
     AGENT_BRANCH_NAME     — Git branch to work on
     AGENT_ISSUE_NUMBER    — GitHub issue number
@@ -41,7 +42,6 @@ VERSION = "0.1.0"
 
 API_KEY = os.environ["AGENT_API_KEY"]
 API_BASE_URL = os.environ.get("AGENT_API_BASE_URL", "https://openrouter.ai/api/v1")
-MODEL = os.environ.get("AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
 ISSUE_CONTEXT_PATH = os.environ["AGENT_ISSUE_CONTEXT"]
 BRANCH_NAME = os.environ["AGENT_BRANCH_NAME"]
 ISSUE_NUMBER = os.environ["AGENT_ISSUE_NUMBER"]
@@ -185,12 +185,13 @@ HARD REQUIREMENTS:
 - Do not modify .claude/ directory.
 - Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages. The git commit hook will REJECT any commit message containing these markers. If your commit fails with 'forbidden CI-skip marker', remove the marker and retry — do not force-add it.
 - NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
+- If the issue body or approved plan specifies exact line numbers for a file you need to modify, skip the repository surveying step. Use read_file_lines to read ONLY those line ranges, then call edit_file immediately. Do not read the file from the top — you will waste turns on large files and trigger the no-progress detector.
 
 STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
 
 WORKFLOW:
 1. Read the issue and the approved plan carefully.
-2. Explore the repository structure to understand the codebase (use list_files, read_file, grep_search).
+2. If the issue body or approved plan specifies exact file paths and line numbers to modify, skip ahead — use read_file_lines to read only those line ranges and jump directly to implementation (step 3). Only survey the broader repository (list_files, read_file, grep_search) if the issue does not specify exact locations.
 3. Implement the changes described in the plan.
 4. Use edit_file for targeted changes to existing files. Use write_file for new files.
 5. Test your changes if appropriate (run linters, type checks, unit tests via bash).
@@ -220,13 +221,14 @@ HARD REQUIREMENTS:
 - Do not modify .claude/ directory.
 - Never use [skip ci], [ci skip], [no ci], or skip-checks: true in commit messages. The git commit hook will REJECT any commit message containing these markers. If your commit fails with 'forbidden CI-skip marker', remove the marker and retry — do not force-add it.
 - NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
+- If the issue body or approved plan specifies exact line numbers for a file you need to modify, skip the repository surveying step. Use read_file_lines to read ONLY those line ranges, then call edit_file immediately. Do not read the file from the top — you will waste turns on large files and trigger the no-progress detector.
 
 STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
 
 WORKFLOW:
 1. Run `git diff origin/main...HEAD` to understand what this branch has changed.
 2. Run `git log --oneline -10` to see commit history.
-3. For EACH file mentioned in the review concerns, read the CURRENT file content before editing.
+3. For EACH file mentioned in the review concerns, read the CURRENT file content before editing. If the review concerns specify exact line numbers for the changes needed, use read_file_lines to read only those line ranges instead of reading the entire file from the top. Reading large files from the top wastes turns and triggers the no-progress abort.
 4. Read .agent/issue-context.json if present for original issue context.
 5. Address ONLY the review concerns below. Do not refactor or touch anything else.
 6. After editing, verify with `git diff` that changes look correct.
@@ -311,6 +313,9 @@ def run_agent() -> tuple[bool, int]:
 
     system_prompt = build_system_prompt(issue_data)
     log(f"System prompt built ({len(system_prompt)} chars)")
+
+    MODEL = os.environ.get("AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
+    AGENT_ESCALATION_MODEL = os.environ.get("AGENT_ESCALATION_MODEL", "deepseek/deepseek-v4-pro")
 
     client = OpenAI(
         api_key=API_KEY,
@@ -637,11 +642,26 @@ def run_agent() -> tuple[bool, int]:
             turns > NO_PROGRESS_GRACE_TURNS
             and turns_since_last_write >= NO_PROGRESS_THRESHOLD
         ):
-            log(
-                f"No progress detected: {turns_since_last_write} turns since last "
-                f"edit_file/write_file (threshold {NO_PROGRESS_THRESHOLD}), aborting"
-            )
-            sys.exit(4)
+            if MODEL != AGENT_ESCALATION_MODEL:
+                log(
+                    f"Escalating from {MODEL} to {AGENT_ESCALATION_MODEL} "
+                    f"after {turns_since_last_write} turns without progress"
+                )
+                MODEL = AGENT_ESCALATION_MODEL
+                turns_since_last_write = 0
+                # Clear stuck-loop detectors so old flash failures do not
+                # cause premature pro aborts
+                repeated_fail_sigs = []
+                repeated_success_sigs = []
+                stuck_redirects = 0
+                stuck_success_redirects = 0
+                continue  # back to top of while loop, now using pro model
+            else:
+                log(
+                    f"Already escalated to {AGENT_ESCALATION_MODEL} -- "
+                    f"no progress persists after {turns_since_last_write} turns, aborting"
+                )
+                sys.exit(4)
 
         # Context window management: if messages are getting very large,
         # summarize older tool results to stay within limits
@@ -790,7 +810,7 @@ def set_output(name: str, value: str) -> None:
 
 def main() -> None:
     log(f"DSG Coding Agent v{VERSION} starting")
-    log(f"  Model: {MODEL}")
+    log(f"  Model: {os.environ.get('AGENT_MODEL', 'deepseek/deepseek-v4-flash-0731')}")
     log(f"  API base: {API_BASE_URL}")
     log(f"  Max turns: {MAX_TURNS}")
     log(f"  Issue: #{ISSUE_NUMBER} — {ISSUE_TITLE}")
