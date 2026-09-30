@@ -44,6 +44,10 @@ inputs:
     description: Model identifier (e.g. deepseek/deepseek-v4-flash-0731, gpt-4o).
     required: false
     default: "deepseek/deepseek-v4-flash-0731"
+  escalation-model:
+    description: Model to escalate to when the primary model hits no_progress (e.g. deepseek/deepseek-v4-pro).
+    required: false
+    default: "deepseek/deepseek-v4-pro"
   api-base-url:
     description: Base URL for the OpenAI-compatible API.
     required: false
@@ -76,6 +80,7 @@ runs:
         AGENT_API_KEY: ${{ inputs.api-key }}
         AGENT_API_BASE_URL: ${{ inputs.api-base-url }}
         AGENT_MODEL: ${{ inputs.model }}
+        AGENT_ESCALATION_MODEL: ${{ inputs.escalation-model }}
         AGENT_ISSUE_CONTEXT: ${{ inputs.issue-context }}
         AGENT_BRANCH_NAME: ${{ inputs.branch-name }}
         AGENT_ISSUE_NUMBER: ${{ inputs.issue-number }}
