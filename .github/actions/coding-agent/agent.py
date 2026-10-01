@@ -811,6 +811,7 @@ def set_output(name: str, value: str) -> None:
 def main() -> None:
     log(f"DSG Coding Agent v{VERSION} starting")
     log(f"  Model: {os.environ.get('AGENT_MODEL', 'deepseek/deepseek-v4-flash-0731')}")
+    log(f"  Escalation model: {os.environ.get('AGENT_ESCALATION_MODEL', 'deepseek/deepseek-v4-pro')}")
     log(f"  API base: {API_BASE_URL}")
     log(f"  Max turns: {MAX_TURNS}")
     log(f"  Issue: #{ISSUE_NUMBER} — {ISSUE_TITLE}")
