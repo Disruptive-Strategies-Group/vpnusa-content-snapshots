@@ -467,7 +467,9 @@ jobs:
                 const openBlocked = openResp.data.filter(i =>
                   i.title.includes('[AGENT:DEPLOYING]') || i.title.includes('[DEPLOYMENT BLOCKED]')
                 );
-                const closedBlocked = closedResp.data.filter(i => i.title.includes('[DEPLOYMENT BLOCKED]'));
+                const closedBlocked = closedResp.data.filter(i =>
+                  i.title.includes('[DEPLOYMENT BLOCKED]') || i.title.includes('[AGENT:DEPLOYING]')
+                );
                 const openNums = new Set(openBlocked.map(i => i.number));
                 const allBlocked = [
                   ...openBlocked.filter(i => !excludeIssueNumbers.has(i.number)),
@@ -1017,8 +1019,10 @@ jobs:
                   const closedResp = await github.rest.issues.listForRepo({
                     owner, repo, state: 'closed', per_page: 100, sort: 'updated', direction: 'desc'
                   });
-                  closedBlocked = closedResp.data.filter(i => i.title.includes('[DEPLOYMENT BLOCKED]'));
-                  console.log(`Found ${closedBlocked.length} closed issue(s) with [DEPLOYMENT BLOCKED] title.`);
+                  closedBlocked = closedResp.data.filter(i =>
+                    i.title.includes('[DEPLOYMENT BLOCKED]') || i.title.includes('[AGENT:DEPLOYING]')
+                  );
+                  console.log(`Found ${closedBlocked.length} closed issue(s) with [DEPLOYMENT BLOCKED] or [AGENT:DEPLOYING] title.`);
                 } catch (e) {
                   console.log(`Closed BLOCKED issue fetch failed: ${e instanceof Error ? e.message : String(e)}`);
                 }
