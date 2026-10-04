@@ -23,6 +23,7 @@ Environment variables (set by the composite action):
 from __future__ import annotations
 
 import hashlib
+import httpx
 import json
 import os
 import re
@@ -67,7 +68,7 @@ API_REQUEST_TIMEOUT = 180.0
 # plus tool execution — so no single turn can hang indefinitely regardless of
 # what stalls. Must exceed API_REQUEST_TIMEOUT to allow at least one full API
 # attempt before the alarm fires.
-TURN_WALL_CLOCK_TIMEOUT = 300  # 5 minutes
+TURN_WALL_CLOCK_TIMEOUT = 180  # 3 minutes
 
 # No-progress detection: hard-stop when the agent burns too many turns without
 # any edit_file/write_file call (e.g. an endless successful-but-non-writing
@@ -320,7 +321,12 @@ def run_agent() -> tuple[bool, int]:
     client = OpenAI(
         api_key=API_KEY,
         base_url=API_BASE_URL,
-        timeout=API_REQUEST_TIMEOUT,
+        timeout=httpx.Timeout(
+            connect=30.0,  # 30s to establish connection
+            read=90.0,  # 90s max between received chunks
+            write=30.0,  # 30s to send request body
+            pool=10.0,  # 10s to acquire connection from pool
+        ),
         max_retries=0,
     )
     log(f"Initialized API client: {API_BASE_URL} / model={MODEL}")
@@ -404,12 +410,17 @@ def run_agent() -> tuple[bool, int]:
                 tools=TOOL_SCHEMAS,
                 tool_choice=effective_tool_choice,
                 temperature=0.0,
-                timeout=API_REQUEST_TIMEOUT,
             )
         except TurnTimeoutError:
             signal.alarm(0)
             log(f"⚠ Turn {turns} exceeded {TURN_WALL_CLOCK_TIMEOUT}s wall clock timeout")
             consecutive_errors += 1
+            # Switch model to avoid re-hitting a stalled provider
+            if MODEL == AGENT_ESCALATION_MODEL:
+                MODEL = os.environ.get("AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
+            else:
+                MODEL = AGENT_ESCALATION_MODEL
+            log(f"Switched model to {MODEL} for retry")
             if consecutive_errors >= max_consecutive_errors:
                 log(f"Max consecutive errors ({max_consecutive_errors}) reached, aborting")
                 return False, turns
