@@ -761,6 +761,8 @@ jobs:
               // When any deploy workflow succeeds, sweep all blocked issues
               // against current HEAD SHA to heal them.
               if (wfRunConclusion === 'success') {
+                // Allow GitHub API eventual consistency to catch up
+                await new Promise(r => setTimeout(r, 3000));
                 await runGlobalBlockedSweep(issueNumbers);
               }
 
@@ -920,6 +922,8 @@ jobs:
 
               // ── Global BLOCKED sweep (repository_dispatch path) ──
               if (dispatchConclusion === 'success') {
+                // Allow GitHub API eventual consistency to catch up
+                await new Promise(r => setTimeout(r, 3000));
                 await runGlobalBlockedSweep(issueNumbers);
               }
 
