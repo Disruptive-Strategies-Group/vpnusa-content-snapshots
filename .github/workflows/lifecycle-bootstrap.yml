@@ -11,15 +11,6 @@ on:
   push:
     branches: [main]
   workflow_run:
-    workflows:
-      - "Deploy Agent + CI to Org"
-      - "Deploy (SAM)"
-      - "Deploy Anedot (SAM)"
-      - "Deploy NationBuilder (SAM)"
-      - "Terraform Deploy"
-      - "Frontend Deploy"
-      - "Deploy"
-      - "quicksight-deploy"
     types: [completed]
   workflow_dispatch:
   repository_dispatch:
