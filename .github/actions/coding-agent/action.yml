@@ -71,7 +71,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        pip install --quiet "openai>=1.30.0"
+        pip install --quiet "openai>=1.30.0" "httpx>=0.23.0"
 
     - name: Run coding agent
       id: agent
