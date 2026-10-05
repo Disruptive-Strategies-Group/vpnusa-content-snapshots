@@ -719,8 +719,8 @@ jobs:
                           console.log(`Issue #${issueNum}: waiting for sets: ${pending.join(', ')}`);
                         }
                       }
-                    } else {
-                      if (expectedWorkflows !== null && !expectedWorkflows.includes(wfRunName)) {
+                    } else if (expectedWorkflows !== null) {
+                      if (!expectedWorkflows.includes(wfRunName)) {
                         console.log(`Issue #${issueNum}: ignoring "${wfRunName}" (not in expected set: ${JSON.stringify(expectedWorkflows)})`);
                         continue;
                       }
@@ -748,6 +748,9 @@ jobs:
                       } else {
                         await setDeploymentBlocked(issueNum, wfRunName, wfRunConclusion);
                       }
+                    } else {
+                      console.log(`Issue #${issueNum}: no lifecycle metadata found (no deploy required). Skipping.`);
+                      continue;
                     }
                   } catch (e) {
                     console.log(`Failed issue #${issueNum}: ${e.message}`);
