@@ -68,7 +68,7 @@ API_REQUEST_TIMEOUT = 180.0
 # plus tool execution — so no single turn can hang indefinitely regardless of
 # what stalls. Must exceed API_REQUEST_TIMEOUT to allow at least one full API
 # attempt before the alarm fires.
-TURN_WALL_CLOCK_TIMEOUT = 180  # 3 minutes
+TURN_WALL_CLOCK_TIMEOUT = 240  # 4 minutes (exceeds API_REQUEST_TIMEOUT by 60s)
 
 # No-progress detection: hard-stop when the agent burns too many turns without
 # any edit_file/write_file call (e.g. an endless successful-but-non-writing
@@ -383,6 +383,10 @@ def run_agent() -> tuple[bool, int]:
     # Resets to 0 on any write; hard-stops with sys.exit(4) once the grace
     # period has passed and the counter reaches NO_PROGRESS_THRESHOLD.
     turns_since_last_write = 0
+    # Cap compaction-driven no-progress resets to prevent infinite
+    # read-only loops where every compaction resets the counter and the
+    # agent endlessly re-reads the same large file.
+    compaction_resets = 0
 
     has_made_tool_call = False
     tool_choice_required_failed = False
@@ -505,6 +509,7 @@ def run_agent() -> tuple[bool, int]:
                 has_attempted_edit = True
                 wrote_since_success_reset = True
                 turns_since_last_write = 0
+                compaction_resets = 0
 
             if result["is_error"]:
                 log(f"  Error: {result['output'][:200]}")
@@ -685,8 +690,15 @@ def run_agent() -> tuple[bool, int]:
             # Reset no-progress counter: compaction drops tool results and forces the
             # agent to re-read files it had already read. Those recovery turns are
             # legitimate work, not agent inactivity, and must not count toward the
-            # no-progress hard-stop.
-            turns_since_last_write = 0
+            # no-progress hard-stop. However, unlimited resets enable infinite
+            # read-only loops; after 2 compaction-driven resets without a file write,
+            # stop resetting so the no-progress detector can fire.
+            if compaction_resets < 2:
+                turns_since_last_write = 0
+                compaction_resets += 1
+                log(f"Compaction reset counter {compaction_resets}/2")
+            else:
+                log("WARNING: Compaction limit reached - no-progress counter will not be reset again")
             # Also clear the success-repetition-loop tracker. Compaction drops
             # tool results and forces the agent to re-read files it had already
             # read; those recovery re-reads are legitimate work and must not be
