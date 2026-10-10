@@ -659,12 +659,24 @@ jobs:
                 ;;
               *)
                 # Fall back to existing string-based fingerprints for reasons agent.py can't distinguish by code
-                if echo "$last_log" | grep -q "Hit max_turns"; then
+                if [ -z "$last_log" ]; then
+                  reason="agent_silent_crash"
+                  detail="Agent produced no output to stdout or stderr. Possible causes: module import failure, OOM kill, or job timeout before first log call."
+                elif echo "$last_log" | grep -q "Hit max_turns"; then
                   reason="max_turns"
                   detail="$(echo "$last_log" | grep 'Hit max_turns' | tail -1)"
                 elif echo "$last_log" | grep -q "Agent stuck in"; then
                   reason="stuck_loop"
                   detail="$(echo "$last_log" | grep 'Agent stuck in' | tail -1)"
+                elif echo "$last_log" | grep -q "Too many consecutive API errors"; then
+                  reason="api_errors"
+                  detail="$(echo "$last_log" | grep 'Too many consecutive API errors' | tail -1)"
+                elif echo "$last_log" | grep -q "Max consecutive errors.*reached, aborting"; then
+                  reason="wall_clock_timeout_turns"
+                  detail="$(echo "$last_log" | grep 'Max consecutive errors' | tail -1)"
+                elif echo "$last_log" | grep -q "Agent returned text-only without making any edits"; then
+                  reason="no_edits"
+                  detail="$(echo "$last_log" | grep 'text-only' | tail -1)"
                 elif echo "$last_log" | grep -q "The action has timed out"; then
                   reason="wall_clock_timeout"
                   detail="Implement step exceeded its timeout-minutes budget"
