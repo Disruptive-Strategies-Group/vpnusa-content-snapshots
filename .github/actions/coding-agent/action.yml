@@ -73,6 +73,16 @@ runs:
         set -euo pipefail
         pip install --quiet "openai>=1.30.0" "httpx>=0.23.0"
 
+    - name: Install test dependencies (if any)
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -f requirements-test.txt ]; then
+          pip install --quiet -r requirements-test.txt
+        elif [ -f requirements.txt ]; then
+          pip install --quiet -r requirements.txt
+        fi
+
     - name: Run coding agent
       id: agent
       shell: bash
