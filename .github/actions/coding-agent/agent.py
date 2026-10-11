@@ -190,6 +190,12 @@ HARD REQUIREMENTS:
 
 STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
 
+STOP RULE (TEST IMPORT ERRORS): If you run a test or Python script that fails with importing errors (ModuleNotFoundError, ImportError), STOP. Do NOT retry the same failing test. Instead:
+1. Read the file requirements-test.txt. If the file exists, install it with: pip install --quiet -r requirements-test.txt. If requirements-test.txt does not exist, read requirements.txt and install it via: pip install --quiet -r requirements.txt.
+2. After installing, re-run the test exactly once. If it still fails with imports, commit a SKIP.md explaining which imports failed and end your turn.
+3. If no requirements file exists and the missing module is from the same repo, create the missing __init__.py or fix the import path, commit, and end your turn.
+Do NOT repeatedly run the same failing test -- this triggers the error-loop detector.
+
 WORKFLOW:
 1. Read the issue and the approved plan carefully.
 2. If the issue body or approved plan specifies exact file paths and line numbers to modify, skip ahead — use read_file_lines to read only those line ranges and jump directly to implementation (step 3). Only survey the broader repository (list_files, read_file, grep_search) if the issue does not specify exact locations.
@@ -225,6 +231,12 @@ HARD REQUIREMENTS:
 - If the issue body or approved plan specifies exact line numbers for a file you need to modify, skip the repository surveying step. Use read_file_lines to read ONLY those line ranges, then call edit_file immediately. Do not read the file from the top — you will waste turns on large files and trigger the no-progress detector.
 
 STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
+
+STOP RULE (TEST IMPORT ERRORS): If you run a test or Python script that fails with importing errors (ModuleNotFoundError, ImportError), STOP. Do NOT retry the same failing test. Instead:
+1. Read the file requirements-test.txt. If the file exists, install it with: pip install --quiet -r requirements-test.txt. If requirements-test.txt does not exist, read requirements.txt and install it via: pip install --quiet -r requirements.txt.
+2. After installing, re-run the test exactly once. If it still fails with imports, commit a SKIP.md explaining which imports failed and end your turn.
+3. If no requirements file exists and the missing module is from the same repo, create the missing __init__.py or fix the import path, commit, and end your turn.
+Do NOT repeatedly run the same failing test -- this triggers the error-loop detector.
 
 WORKFLOW:
 1. Run `git diff origin/main...HEAD` to understand what this branch has changed.
@@ -557,8 +569,14 @@ def run_agent() -> tuple[bool, int]:
                             "role": "system",
                             "content": (
                                 "SYSTEM: You keep hitting the same import/mock error "
-                                f"({err_sig}). Read the actual source file and copy its "
-                                "imports exactly, or commit a SKIP.md explaining why this "
+                                f"({err_sig}).\n\n"
+                                "- If it's a missing third-party package, install it via "
+                                "pip install <package>. Check for requirements-test.txt or "
+                                "requirements.txt first.\n"
+                                "- If the module is from the same repo but can't be imported "
+                                "(missing __init__.py), create the file, commit it, and end "
+                                "your turn.\n"
+                                "- Alternatively, commit a SKIP.md explaining why this "
                                 "cannot be done and end your turn."
                             ),
                         })
