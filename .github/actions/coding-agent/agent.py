@@ -602,18 +602,31 @@ def run_agent() -> tuple[bool, int]:
                 }
             )
 
-        # Stuck-loop detection: check for repeated identical failing tool calls
-        if len(repeated_fail_sigs) >= 3 and len(set(repeated_fail_sigs[-3:])) == 1:
+        # Stuck-loop detection: check for 5+ repeated identical failing tool calls
+        if len(repeated_fail_sigs) >= 5 and len(set(repeated_fail_sigs[-5:])) == 1:
             log(
-                f"WARNING: Agent repeated the same failing tool call "
-                f"{len(repeated_fail_sigs)} times consecutively"
+                "WARNING: Agent repeated the same failing tool call "
+                "5 times consecutively"
             )
             if stuck_redirects >= 2:
-                log(
-                    "Agent stuck in repeated failure loop after redirect "
-                    "attempts, aborting"
-                )
-                return False, turns
+                if MODEL != AGENT_ESCALATION_MODEL:
+                    log(
+                        f"Escalating from {MODEL} to {AGENT_ESCALATION_MODEL} "
+                        f"after stuck loop"
+                    )
+                    MODEL = AGENT_ESCALATION_MODEL
+                    turns_since_last_write = 0
+                    repeated_fail_sigs = []
+                    repeated_success_sigs = []
+                    stuck_redirects = 0
+                    stuck_success_redirects = 0
+                    continue  # back to top of while loop, now using pro model
+                else:
+                    log(
+                        f"Already escalated to {AGENT_ESCALATION_MODEL} -- "
+                        f"stuck loop persists, aborting"
+                    )
+                    return False, turns
             # Inject a redirect message to nudge the model toward a different approach
             messages.append(
                 {
@@ -631,24 +644,38 @@ def run_agent() -> tuple[bool, int]:
             repeated_fail_sigs = []
             log(f"Redirect injected (attempt {stuck_redirects}/2)")
 
-        # Stuck-loop detection: check for repeated identical successful tool calls
-        # with no intervening edit_file/write_file (a read loop that never writes).
+        # Stuck-loop detection: check for 5+ repeated identical successful tool
+        # calls with no intervening edit_file/write_file (a read loop that never
+        # writes).
         if (
-            len(repeated_success_sigs) >= 3
-            and len(set(repeated_success_sigs[-3:])) == 1
+            len(repeated_success_sigs) >= 5
+            and len(set(repeated_success_sigs[-5:])) == 1
             and not wrote_since_success_reset
         ):
             log(
-                f"WARNING: Agent repeated the same successful tool call "
-                f"{len(repeated_success_sigs)} times consecutively with no "
-                f"edit_file/write_file (success repetition loop)"
+                "WARNING: Agent repeated the same successful tool call "
+                "5 times consecutively with no "
+                "edit_file/write_file (success repetition loop)"
             )
             if stuck_success_redirects >= 2:
-                log(
-                    "Agent stuck in success repetition loop after redirect "
-                    "attempts, aborting"
-                )
-                return False, turns
+                if MODEL != AGENT_ESCALATION_MODEL:
+                    log(
+                        f"Escalating from {MODEL} to {AGENT_ESCALATION_MODEL} "
+                        f"after stuck loop"
+                    )
+                    MODEL = AGENT_ESCALATION_MODEL
+                    turns_since_last_write = 0
+                    repeated_fail_sigs = []
+                    repeated_success_sigs = []
+                    stuck_redirects = 0
+                    stuck_success_redirects = 0
+                    continue  # back to top of while loop, now using pro model
+                else:
+                    log(
+                        f"Already escalated to {AGENT_ESCALATION_MODEL} -- "
+                        f"stuck loop persists, aborting"
+                    )
+                    return False, turns
             # Inject a redirect message to nudge the model toward making progress
             messages.append(
                 {
