@@ -891,11 +891,26 @@ jobs:
               }
 
               if (implementResult === 'failure' && branchAdvanced) {
+                const failureHeadlines = {
+                  max_turns: 'Agent hit the turn limit.',
+                  stuck_loop: 'Agent got stuck in a repeated failure loop.',
+                  no_progress: 'Agent made no progress after many turns.',
+                  api_errors: 'Agent hit too many consecutive API errors.',
+                  error_loop: 'Agent repeated the same import/mock error.',
+                  no_edits: 'Agent returned text-only responses without making edits.',
+                  wall_clock_timeout: 'Agent implementation step exceeded its timeout.',
+                  wall_clock_timeout_turns: 'Agent hit max consecutive errors from wall-clock timeouts.',
+                  agent_error: 'Agent run failed.',
+                  sanitize_failed: 'CI-skip sanitization failed.',
+                  push_failed: 'Push to remote branch failed.',
+                  agent_silent_crash: 'Agent run failed (silent crash).'
+                };
+                const headline = failureHeadlines[failureReason] || 'Agent run failed.';
                 const newTitle = RED + ' [AGENT:BLOCKED] ' + stripAllPrefixes(currentTitle);
                 try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
                 await github.rest.issues.createComment({
                   owner, repo, issue_number,
-                  body: `<!-- AGENT_BLOCKED -->\nAgent hit the turn limit. Partial work has been committed to \`${process.env.BRANCH_NAME}\`. Comment \`/agent approve\` to continue from the current branch state.\n\nRoot cause: **${failureReason}**\n\nDetail:\n\`\`\`\n${failureDetail}\n\`\`\`\n\nFull workflow log: [${runUrl}](${runUrl})\n\nStatus: AGENT:BLOCKED`
+                  body: `<!-- AGENT_BLOCKED -->\n${headline} Partial work has been committed to \`${process.env.BRANCH_NAME}\`. Comment \`/agent approve\` to continue from the current branch state.\n\nRoot cause: **${failureReason}**\n\nDetail:\n\`\`\`\n${failureDetail}\n\`\`\`\n\nFull workflow log: [${runUrl}](${runUrl})\n\nStatus: AGENT:BLOCKED`
                 });
                 return;
               }
