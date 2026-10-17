@@ -651,11 +651,14 @@ jobs:
             case "$agent_exit" in
               3)
                 reason="error_loop"
-                detail="$(echo "$last_log" | grep -E 'Repeated error loop|Error signature' | tail -3)"
+                detail="$(echo "$last_log" | grep -E 'Repeated error loop|Error signature' | tail -3 || true)"
                 ;;
               4)
                 reason="no_progress"
-                detail="$(echo "$last_log" | grep -E 'No progress detected|Turns since last write' | tail -3)"
+                detail="$(echo "$last_log" | grep -E 'no progress persists|without progress|Compaction limit reached' | tail -3 || true)"
+                if [ -z "$detail" ]; then
+                  detail="Agent aborted by the no-progress watchdog (exit code 4): no edit_file or write_file call for the last 25 turns, after escalation to the stronger model. See the implement job log."
+                fi
                 ;;
               *)
                 # Fall back to existing string-based fingerprints for reasons agent.py can't distinguish by code
