@@ -22,6 +22,7 @@ Environment variables (set by the composite action):
 
 from __future__ import annotations
 
+import collections
 import hashlib
 import httpx
 import json
@@ -79,6 +80,7 @@ TURN_WALL_CLOCK_TIMEOUT = 240  # 4 minutes (exceeds API_REQUEST_TIMEOUT by 60s)
 # detection) so the workflow can surface ROOT_CAUSE: no_progress.
 NO_PROGRESS_THRESHOLD = 25
 NO_PROGRESS_GRACE_TURNS = 30
+NO_PROGRESS_NUDGE_AT = 15
 
 class TurnTimeoutError(Exception):
     """Raised when a single agentic turn exceeds TURN_WALL_CLOCK_TIMEOUT."""
@@ -395,6 +397,8 @@ def run_agent() -> tuple[bool, int]:
     # Resets to 0 on any write; hard-stops with sys.exit(4) once the grace
     # period has passed and the counter reaches NO_PROGRESS_THRESHOLD.
     turns_since_last_write = 0
+    # Last 5 tool call names, for the no-progress abort diagnostic.
+    recent_tools = collections.deque(maxlen=5)
     # Cap compaction-driven no-progress resets to prevent infinite
     # read-only loops where every compaction resets the counter and the
     # agent endlessly re-reads the same large file.
@@ -506,6 +510,7 @@ def run_agent() -> tuple[bool, int]:
 
         for tool_call in choice.message.tool_calls:
             fn_name = tool_call.function.name
+            recent_tools.append(fn_name)
             try:
                 fn_args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
@@ -694,6 +699,28 @@ def run_agent() -> tuple[bool, int]:
             wrote_since_success_reset = False
             log(f"Success-loop redirect injected (attempt {stuck_success_redirects}/2)")
 
+        # No-progress nudge: one-time warning when the agent has stalled for
+        # exactly NO_PROGRESS_NUDGE_AT turns after the grace period. Equality
+        # test so it fires at most once per stall; the counter resets on any
+        # write and on escalation, so the nudge re-arms naturally.
+        if (
+            turns > NO_PROGRESS_GRACE_TURNS
+            and turns_since_last_write == NO_PROGRESS_NUDGE_AT
+        ):
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        f"SYSTEM: You have gone {turns_since_last_write} turns "
+                        "without writing a file. Stop reading. Write your first "
+                        "change now with edit_file or write_file, even if partial, "
+                        "then continue in small steps. If you cannot finish the "
+                        "whole task, commit what you have and end your turn."
+                    ),
+                }
+            )
+            log(f"No-progress nudge injected at turn {turns}")
+
         # No-progress detection: hard-stop when the agent burns too many turns
         # without any edit_file/write_file call. Fires only after the grace
         # period so early exploration turns are not penalized. Exit code 4 is
@@ -721,6 +748,10 @@ def run_agent() -> tuple[bool, int]:
                 log(
                     f"Already escalated to {AGENT_ESCALATION_MODEL} -- "
                     f"no progress persists after {turns_since_last_write} turns, aborting"
+                )
+                log(
+                    f"No-progress abort at turn {turns}; "
+                    f"last tool calls: {list(recent_tools)}"
                 )
                 sys.exit(4)
 
