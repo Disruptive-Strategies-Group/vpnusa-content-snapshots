@@ -290,7 +290,7 @@ Each path rule triggers only its own set. A PR touching only frontend files wait
   "version": 3,
   "sets": {
     "frontend_deploy": {
-      "workflows": ["Deploy Analytics Frontend (FPC)"]
+      "workflows": ["Deploy Frontend"]
     }
   },
   "path_rules": [
