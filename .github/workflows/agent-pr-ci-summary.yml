@@ -280,6 +280,10 @@ jobs:
                 return pendingStatuses.has(entry.status);
               }
 
+              // If a check run has a conclusion, it is effectively complete
+              // regardless of its status field.
+              if (entry.conclusion) return false;
+
               return entry.status && entry.status !== 'completed';
             }
 
