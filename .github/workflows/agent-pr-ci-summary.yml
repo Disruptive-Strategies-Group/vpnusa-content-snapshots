@@ -166,10 +166,8 @@ jobs:
             // E. Exclude pipeline-internal check runs — these are not CI quality gates
             const PIPELINE_CHECKS = new Set([
               'summarize-pr-ci',   // agent-pr-ci-summary.yml
-              'review',            // agent-pr-review.yml
               'revise',            // agent-pr-revise.yml
               'merge',             // agent-merge.yml
-              'claude-verdict',    // agent-pr-claude-verdict.yml
             ]);
 
             let allEntries = [...statusContexts, ...checkRuns]
