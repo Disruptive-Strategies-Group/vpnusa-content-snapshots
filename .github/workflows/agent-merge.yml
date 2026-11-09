@@ -192,12 +192,36 @@ jobs:
               });
               core.info('Merge succeeded.');
             } catch (mergeError) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: prNumber,
-                body: `<!-- AGENT_VERDICT --> ESCALATE\n\n@${repoOwner} — Merge failed. Human intervention required.\n\n**Error:** ${mergeError.message}`
-              });
-              core.info(`Merge failed: ${mergeError.message}`);
-              return;
+              // If branch is behind main, update it and retry once
+              if (mergeError.message && mergeError.message.includes('head cannot be in the past')) {
+                core.info('Branch is behind main. Updating branch and retrying merge...');
+                await github.rest.pulls.updateBranch({ owner, repo, pull_number: prNumber });
+                // Wait for the update to propagate
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                // Retry merge
+                try {
+                  mergeResponse = await github.rest.pulls.merge({
+                    owner, repo, pull_number: prNumber, merge_method: 'squash',
+                    commit_title: `${prTitle} (#${prNumber})`,
+                    commit_message: verdictSummary
+                  });
+                  core.info('Merge succeeded on retry after branch update.');
+                } catch (retryError) {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number: prNumber,
+                    body: `<!-- AGENT_VERDICT --> ESCALATE\n\n@${repoOwner} — Merge failed after branch update retry.\n\n**Error:** ${retryError.message}`
+                  });
+                  core.info(`Merge failed on retry: ${retryError.message}`);
+                  return;
+                }
+              } else {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: `<!-- AGENT_VERDICT --> ESCALATE\n\n@${repoOwner} — Merge failed. Human intervention required.\n\n**Error:** ${mergeError.message}`
+                });
+                core.info(`Merge failed: ${mergeError.message}`);
+                return;
+              }
             }
 
             const mergeSha = mergeResponse.data.sha;
