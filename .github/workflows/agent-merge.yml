@@ -118,6 +118,14 @@ jobs:
 
             core.info(`human_changes_requested: ${humanChangesRequested}`);
 
+      - name: Approve PR
+        if: steps.guard.outputs.already_merged != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          gh pr review "${{ steps.parse.outputs.pr_number }}" --approve --body "Auto-approved by merge gate. Both Gate 1 and Gate 2 have passed."
+
       - name: Evaluate gates and merge
         if: steps.guard.outputs.already_merged != 'true'
         uses: actions/github-script@v7
