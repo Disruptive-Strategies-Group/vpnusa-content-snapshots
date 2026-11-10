@@ -82,11 +82,39 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
+        cd "${GITHUB_WORKSPACE:-$(pwd)}"
+
+        # Directories at depth 0, 1 and 2 (root, x/, x/y/), excluding non-source directories.
+        mapfile -t DIRS < <(
+          find . -maxdepth 2 \
+            \( -name .git -o -name node_modules -o -name .venv -o -name venv \
+               -o -name .agent -o -name cdk.out -o -name .aws-sam -o -name .terraform \) \
+            -prune -o -type d -print | sort
+        )
+
+        # Repo root: requirements-test.txt, else requirements.txt (unchanged behavior).
         if [ -f requirements-test.txt ]; then
           pip install --quiet -r requirements-test.txt
         elif [ -f requirements.txt ]; then
           pip install --quiet -r requirements.txt
         fi
+
+        # Nested directories: requirements-test.txt ONLY.
+        for d in "${DIRS[@]}"; do
+          if [ "$d" != "." ] && [ -f "$d/requirements-test.txt" ]; then
+            pip install --quiet -r "$d/requirements-test.txt"
+          fi
+        done
+
+        # PYTHONPATH additions: <abs dir>/src for every scanned directory whose src/ contains a .py file.
+        EXTRA=""
+        for d in "${DIRS[@]}"; do
+          if [ -d "$d/src" ] && [ -n "$(find "$d/src" -name '*.py' -print -quit)" ]; then
+            abs_src="$(cd "$d" && pwd)/src"
+            EXTRA="${EXTRA:+${EXTRA}:}${abs_src}"
+          fi
+        done
+        echo "AGENT_EXTRA_PYTHONPATH=${EXTRA}" >> "$GITHUB_ENV"
 
     - name: Run coding agent
       id: agent
@@ -107,7 +135,7 @@ runs:
       run: |
         set -euo pipefail
         set +e
-        export PYTHONPATH="${{ github.action_path }}"
+        export PYTHONPATH="${{ github.action_path }}${AGENT_EXTRA_PYTHONPATH:+:${AGENT_EXTRA_PYTHONPATH}}"
         python3 "${{ github.action_path }}/agent.py" 2>&1 | tee -a /tmp/agent-stdout.log
         rc=${PIPESTATUS[0]}
         set -e
