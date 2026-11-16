@@ -62,6 +62,21 @@ on:
         required: false
         type: string
         default: '[]'
+      dispatch_failed_step:
+        description: 'Name of the failed deploy step from repository_dispatch lifecycle-deploy-signal'
+        required: false
+        type: string
+        default: ''
+      dispatch_run_url:
+        description: 'Workflow run URL from repository_dispatch lifecycle-deploy-signal'
+        required: false
+        type: string
+        default: ''
+      dispatch_log_tail:
+        description: 'Redacted last 40 log lines from repository_dispatch lifecycle-deploy-signal'
+        required: false
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -87,6 +102,9 @@ jobs:
           INPUT_DISPATCH_CONCLUSION: ${{ inputs.dispatch_conclusion }}
           INPUT_DISPATCH_SHA: ${{ inputs.dispatch_sha }}
           INPUT_DISPATCH_ISSUE_NUMBERS: ${{ inputs.dispatch_issue_numbers }}
+          INPUT_DISPATCH_FAILED_STEP: ${{ inputs.dispatch_failed_step }}
+          INPUT_DISPATCH_RUN_URL: ${{ inputs.dispatch_run_url }}
+          INPUT_DISPATCH_LOG_TAIL: ${{ inputs.dispatch_log_tail }}
         with:
           github-token: ${{ github.token }}
           script: |
@@ -106,6 +124,9 @@ jobs:
             const dispatchIssueNums = (() => {
               try { return JSON.parse(process.env.INPUT_DISPATCH_ISSUE_NUMBERS || '[]'); } catch { return []; }
             })();
+            const dispatchFailedStep = process.env.INPUT_DISPATCH_FAILED_STEP || '';
+            const dispatchRunUrl     = process.env.INPUT_DISPATCH_RUN_URL     || '';
+            const dispatchLogTail    = process.env.INPUT_DISPATCH_LOG_TAIL    || '';
 
             // ── Emoji constants ──────────────────────────────────────────────
             const BLUE   = String.fromCodePoint(0x1F535);
@@ -361,7 +382,7 @@ jobs:
               console.log(`Issue #${issueNum}: DEPLOYMENT COMPLETE.`);
             }
 
-            async function setDeploymentBlocked(issueNum, wfName, conclusion) {
+            async function setDeploymentBlocked(issueNum, wfName, conclusion, details) {
               const { data: issue } = await github.rest.issues.get({ owner, repo, issue_number: issueNum });
               // Dedup: skip if already marked DEPLOYMENT BLOCKED
               if (issue.title.includes('[DEPLOYMENT BLOCKED]')) {
@@ -371,10 +392,20 @@ jobs:
               const stripped = stripAllPrefixes(issue.title);
               const newTitle = RED + ' [DEPLOYMENT BLOCKED] ' + stripped;
               await github.rest.issues.update({ owner, repo, issue_number: issueNum, title: newTitle });
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: issueNum,
-                body: `Deployment blocked: workflow "${wfName}" concluded with: ${conclusion}.`
-              });
+
+              let body = `Deployment blocked: workflow "${wfName}" concluded with: ${conclusion}.`;
+              if (details) {
+                const parts = [];
+                if (details.failedStep) parts.push(`Failed step: ${details.failedStep}`);
+                if (details.runUrl) parts.push(`Run: ${details.runUrl}`);
+                if (details.logTail) parts.push(`Last 40 log lines:\n\`\`\`\n${details.logTail}\n\`\`\``);
+                if (parts.length > 0) body += '\n\n' + parts.join('\n\n');
+              }
+              // Truncate to stay under the GitHub comment size limit (65536 chars).
+              if (body.length > 65000) {
+                body = body.slice(0, 65000) + '\n... (truncated)';
+              }
+              await github.rest.issues.createComment({ owner, repo, issue_number: issueNum, body });
               console.log(`Issue #${issueNum}: DEPLOYMENT BLOCKED (${wfName}).`);
             }
 
@@ -840,7 +871,11 @@ jobs:
                       continue;
                     }
                     if (dispatchConclusion !== 'success') {
-                      await setDeploymentBlocked(issueNum, dispatchSetId, dispatchConclusion);
+                      await setDeploymentBlocked(issueNum, dispatchSetId, dispatchConclusion, {
+                        failedStep: dispatchFailedStep,
+                        runUrl: dispatchRunUrl,
+                        logTail: dispatchLogTail
+                      });
                       continue;
                     }
                     const signalBody = [
@@ -893,7 +928,11 @@ jobs:
                       continue;
                     }
                     if (dispatchConclusion !== 'success') {
-                      await setDeploymentBlocked(issueNum, dispatchWorkflowName, dispatchConclusion);
+                      await setDeploymentBlocked(issueNum, dispatchWorkflowName, dispatchConclusion, {
+                        failedStep: dispatchFailedStep,
+                        runUrl: dispatchRunUrl,
+                        logTail: dispatchLogTail
+                      });
                       continue;
                     }
                     const runsResp = await github.rest.actions.listWorkflowRunsForRepo({
