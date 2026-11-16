@@ -1027,6 +1027,9 @@ jobs:
           }
 
           issue_title=$(gh_with_retry issue view "${ISSUE_NUMBER}" --repo "${GITHUB_REPOSITORY}" --json title -q .title)
+          # Strip lifecycle prefixes the issue title carries (e.g. "🟢 [AGENT:NEEDS-REVIEW] ")
+          # so the PR title does not inherit them.
+          issue_title=$(printf '%s' "${issue_title}" | perl -CSDA -pe '1 while s/^(?:[\x{1F7E1}\x{1F535}\x{1F7E2}\x{1F534}]\s*)?\[AGENT:(?:PLAN-REVIEW|IN-PROGRESS|NEEDS-REVIEW|BLOCKED|DONE)\]\s*//i')
           pr_body=$(cat <<EOF
           Closes #${ISSUE_NUMBER}
 
