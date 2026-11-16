@@ -265,31 +265,60 @@ def edit_file(path: str, old_text: str, new_text: str) -> dict[str, Any]:
         return {"output": f"Error editing {path}: {e}", "is_error": True}
 
 
+def _quote_spans(s: str) -> list[tuple[int, int]]:
+    """Return (start, end) spans of regions enclosed in matching quotes.
+
+    Both single- and double-quoted regions are detected; backslash-escaped
+    characters inside quotes are skipped so escaped quotes do not terminate
+    the region early. Unmatched quotes are ignored.
+    """
+    spans: list[tuple[int, int]] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch in ("'", '"'):
+            j = i + 1
+            while j < n:
+                if s[j] == "\\":
+                    j += 2
+                    continue
+                if s[j] == ch:
+                    break
+                j += 1
+            if j < n:  # matched closing quote
+                spans.append((i, j + 1))
+                i = j + 1
+                continue
+        i += 1
+    return spans
+
+
 def _sanitize_version_specifiers(cmd: str) -> str:
     """
-    Quote any token in cmd that looks like a package version specifier
+    Quote any bare token in cmd that looks like a package version specifier
     (e.g., package>=1.0, pkg!=2.0) so the shell does not interpret
     > or < as redirect operators.  Applies to ALL commands, not just pip.
+
+    Existing quoting is preserved: tokens already enclosed in single or
+    double quotes are left unchanged, so quoted arguments containing spaces
+    (e.g. git commit -m "fix: remove redundant PATCH call") stay intact.
+    The regex matches word>=digits patterns that are never legitimate shell
+    redirects (real redirects have whitespace before the > operator).
     """
-    # Pre-sanitize pass: quote bare tokens like "package>=1.0" before
-    # shlex.split sees them.  This regex matches word>=digits patterns
-    # that are never legitimate shell redirects (real redirects have
-    # whitespace before the > operator).
-    cmd = re.sub(
-        r'(\b\w[\w.\-]*(?:>=|<=|!=|~=|==|>|<)\d[\w.*]*)',
-        lambda m: shlex.quote(m.group(1)),
+    quoted_spans = _quote_spans(cmd)
+
+    def _maybe_quote(match: re.Match) -> str:
+        start = match.start()
+        if any(qs <= start < qe for qs, qe in quoted_spans):
+            return match.group()  # already quoted by the user; leave as-is
+        return shlex.quote(match.group())
+
+    return re.sub(
+        r'\b\w[\w.\-]*(?:>=|<=|!=|~=|==|>|<)\d[\w.*]*',
+        _maybe_quote,
         cmd,
     )
-    # Second pass: tokenize and re-quote any remaining specifier tokens.
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
-        return cmd
-    requoted = [
-        shlex.quote(tok) if re.search(r'\w[><=!~]+\d', tok) else tok
-        for tok in tokens
-    ]
-    return ' '.join(requoted)
 
 
 def bash(command: str) -> dict[str, Any]:
