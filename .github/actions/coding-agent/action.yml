@@ -6,8 +6,9 @@ description: >-
 
 inputs:
   api-key:
-    description: API key for the LLM provider (OpenRouter, OpenAI, etc).
-    required: true
+    description: API key for the LLM provider (OpenRouter, OpenAI, etc). Not needed when provider is bedrock.
+    required: false
+    default: ""
   issue-context:
     description: Path to the issue context JSON file (.agent/issue-context.json).
     required: true
@@ -52,6 +53,14 @@ inputs:
     description: Base URL for the OpenAI-compatible API.
     required: false
     default: "https://openrouter.ai/api/v1"
+  provider:
+    description: "'openai' (default; any OpenAI-compatible API) or 'bedrock' (AWS Bedrock Converse, US-only, uses the job's AWS credentials)."
+    required: false
+    default: "openai"
+  bedrock-region:
+    description: AWS region for Bedrock calls when provider is bedrock.
+    required: false
+    default: "us-east-2"
 
 outputs:
   outcome:
@@ -63,6 +72,12 @@ outputs:
   exit-code:
     description: "agent.py exit code (0=ok, 3=error_loop, 4=no_progress, other=agent_error)"
     value: ${{ steps.agent.outputs.exit_code }}
+  usage-json:
+    description: >-
+      JSON summary of per-model LLM token usage, call counts and estimated
+      cost (USD) for the run; empty when no LLM call succeeded. Consumed by
+      caller workflows to publish DSG/CICD CloudWatch metrics.
+    value: ${{ steps.agent.outputs.usage-json }}
 
 runs:
   using: composite
@@ -77,6 +92,9 @@ runs:
       run: |
         set -euo pipefail
         pip install --quiet "openai>=1.30.0" "httpx>=0.23.0"
+        if [ "${{ inputs.provider }}" = "bedrock" ]; then
+          pip install --quiet "boto3>=1.35.0"
+        fi
 
     - name: Install test dependencies (if any)
       shell: bash
@@ -99,10 +117,16 @@ runs:
           pip install --quiet -r requirements.txt
         fi
 
-        # Nested directories: requirements-test.txt ONLY.
+        # Nested directories: install requirements-test.txt if present; otherwise, if the
+        # directory has a requirements.txt AND contains tests, install it as a fallback so
+        # tests that import the nested directory's production modules can run. The fallback
+        # install must never fail the step (some requirements files need system libraries).
         for d in "${DIRS[@]}"; do
           if [ "$d" != "." ] && [ -f "$d/requirements-test.txt" ]; then
             pip install --quiet -r "$d/requirements-test.txt"
+          elif [ "$d" != "." ] && [ -f "$d/requirements.txt" ] && \
+               { [ -d "$d/tests" ] || [ -n "$(find "$d" -maxdepth 1 -name 'test_*.py' -print -quit)" ]; }; then
+            pip install --quiet -r "$d/requirements.txt" || echo "::warning::could not install $d/requirements.txt; tests importing $d may fail"
           fi
         done
 
@@ -122,6 +146,8 @@ runs:
       env:
         AGENT_API_KEY: ${{ inputs.api-key }}
         AGENT_API_BASE_URL: ${{ inputs.api-base-url }}
+        AGENT_PROVIDER: ${{ inputs.provider }}
+        AGENT_BEDROCK_REGION: ${{ inputs.bedrock-region }}
         AGENT_MODEL: ${{ inputs.model }}
         AGENT_ESCALATION_MODEL: ${{ inputs.escalation-model }}
         AGENT_ISSUE_CONTEXT: ${{ inputs.issue-context }}
