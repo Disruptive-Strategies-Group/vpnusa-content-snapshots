@@ -37,4 +37,7 @@ jobs:
       dispatch_conclusion: ${{ github.event.client_payload.conclusion || '' }}
       dispatch_sha: ${{ github.event.client_payload.sha || '' }}
       dispatch_issue_numbers: ${{ toJSON(github.event.client_payload.issue_numbers) || '[]' }}
+      dispatch_failed_step: ${{ github.event.client_payload.failed_step || '' }}
+      dispatch_run_url: ${{ github.event.client_payload.run_url || '' }}
+      dispatch_log_tail: ${{ github.event.client_payload.log_tail || '' }}
     secrets: inherit
