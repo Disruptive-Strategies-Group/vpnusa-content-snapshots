@@ -111,7 +111,7 @@ jobs:
               const prData = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
               const currentTitle = prData.data.title || '';
               const RED = '🔴'; // 🔴
-              const cleaned = currentTitle.replace(/^[🟡🔵🟢\uD83DĴ]?\s*\[AGENT:[^\]]+\]\s*/iu, '').trim();
+              const cleaned = currentTitle.replace(/(?:[\u{1F7E1}\u{1F535}\u{1F7E2}\u{1F534}]\s*)?\[AGENT:(?:PLAN-REVIEW|IN-PROGRESS|NEEDS-REVIEW|BLOCKED|DONE)\]\s*/giu, '').trim();
               const newTitle = RED + ' [AGENT:BLOCKED] ' + cleaned;
               await github.rest.pulls.update({ owner, repo, pull_number: prNumber, title: newTitle });
 
@@ -518,6 +518,7 @@ jobs:
             });
 
       - name: Safety-net commit and cleanup
+        id: safety_net
         if: >
           steps.cycle_guard.outputs.escalate != 'true' &&
           steps.blocked_check.outputs.blocked != 'true' &&
@@ -555,10 +556,10 @@ jobs:
           CURRENT_SHA="$(git rev-parse HEAD)"
 
           if [ "${CURRENT_SHA}" = "${PRE_PUSH_SHA}" ]; then
-            echo "No new commits produced this run — creating no-op commit to re-trigger CI."
-            echo "# agent-pr-revise no-op: $(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .agent-noop
-            git add .agent-noop
-            git commit -m "chore: re-trigger CI after revision cycle (no changes needed)"
+            echo "No new commits produced this run — not pushing a no-op commit; escalating to a human."
+            echo "noop=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "noop=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Push branch
@@ -566,11 +567,61 @@ jobs:
           steps.cycle_guard.outputs.escalate != 'true' &&
           steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
-          steps.feedback_parse.outputs.no_files != 'true'
+          steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.safety_net.outputs.noop != 'true'
         shell: bash
         run: |
           set -euo pipefail
           git push origin "${{ steps.meta.outputs.head_ref }}"
+
+      - name: Escalate on no-op revision
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.safety_net.outputs.noop == 'true'
+        uses: actions/github-script@v7
+        env:
+          CONCERNS: ${{ steps.concerns.outputs.concerns }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+
+            // Block further automatic cycles and hand the PR to a human.
+            try {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber,
+                labels: ['blocked:non-substantive']
+              });
+            } catch (e) {
+              core.warning(`Could not add blocked:non-substantive label: ${e.message}`);
+            }
+
+            const prData = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+            const currentTitle = prData.data.title || '';
+            const cleaned = currentTitle.replace(/(?:[\u{1F7E1}\u{1F535}\u{1F7E2}\u{1F534}]\s*)?\[AGENT:(?:PLAN-REVIEW|IN-PROGRESS|NEEDS-REVIEW|BLOCKED|DONE)\]\s*/giu, '').trim();
+            await github.rest.pulls.update({ owner, repo, pull_number: prNumber, title: '🔴 [AGENT:BLOCKED] ' + cleaned });
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: [
+                '<!-- AGENT_REVISE_NOOP -->',
+                '🚫 **The revision agent made no change.** Gate 1 and the revision agent disagree about this PR, so no no-op commit was pushed and the PR was not re-sent to Gate 1.',
+                '',
+                'The PR has been labelled `blocked:non-substantive` and titled `[AGENT:BLOCKED]`. A human must review the concerns below and remove the label to resume automatic cycles.',
+                '',
+                '<details><summary>Gate 1 concerns the agent received</summary>',
+                '',
+                process.env.CONCERNS || '',
+                '',
+                '</details>'
+              ].join('\n')
+            });
 
       - name: Capture post-revision diff
         if: >
@@ -608,7 +659,8 @@ jobs:
           steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
           steps.feedback_parse.outputs.no_files != 'true' &&
-          steps.claude.outcome != 'skipped'
+          steps.claude.outcome != 'skipped' &&
+          steps.safety_net.outputs.noop != 'true'
         id: substantive
         shell: bash
         env:
@@ -789,7 +841,8 @@ jobs:
           steps.concerns.outputs.no_concerns != 'true' &&
           steps.feedback_parse.outputs.no_files != 'true' &&
           steps.claude.outcome == 'success' &&
-          steps.substantive.outputs.non_substantive != 'true'
+          steps.substantive.outputs.non_substantive != 'true' &&
+          steps.safety_net.outputs.noop != 'true'
         uses: actions/github-script@v7
         env:
           CONCERNS: ${{ steps.concerns.outputs.concerns }}
