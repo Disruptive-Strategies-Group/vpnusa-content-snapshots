@@ -14,11 +14,25 @@
 # the org's standard OIDC deploy role (same pattern as sam-deploy.yml) —
 # no key is duplicated into GitHub secrets.
 #
+# US-only mode (CICD_US_ONLY == 'true'): the vision review runs on Bedrock
+# (us-east-2) and NEVER calls OpenRouter. It uses a fixed two-tier review:
+# Haiku 5.5 (us.anthropic.claude-haiku-5-5) first, then Sonnet 5.5
+# (us.anthropic.claude-sonnet-5-5) only when Haiku does not return a clean
+# PASS (fail, unparseable output, or a non-ValidationException error). No
+# variable selects the model — the assignment is a fixed decision. global.*
+# prefixes and non-US regions are rejected. In this mode the OpenRouter key is
+# never read from Secrets Manager, and the OIDC runner role
+# (AWS_DEPLOY_ROLE_ARN) must have Bedrock access to both us.* profiles in the
+# account. When CICD_US_ONLY is unset or false, the default OpenRouter path is
+# unchanged. In US-only mode, reference images over about 4.5 MB are
+# downscaled (JPEG) before being sent to Bedrock.
+#
 # Required org secrets:
 #   INTEGRATIONS_SECRET_ARN       — ARN of the integrations secret holding
-#                                   openrouter_api_key
+#                                   openrouter_api_key (not read in US-only mode)
 #   AWS_DEPLOY_ROLE_ARN           — existing OIDC deploy role (already set org-wide);
 #                                   the role has scoped GetSecretValue on that secret
+#                                   and, in US-only mode, Bedrock access
 #   DSG_COMMENTER_APP_ID/_PRIVATE_KEY — review identity (falls back to a plain
 #                                   comment if absent; revise loop won't auto-fire)
 
@@ -100,7 +114,7 @@ jobs:
 
       - name: Fetch OpenRouter key from Secrets Manager
         id: creds
-        if: steps.ctx.outputs.skip != 'true'
+        if: steps.ctx.outputs.skip != 'true' && vars.CICD_US_ONLY != 'true'
         env:
           INTEGRATIONS_SECRET_ARN: ${{ secrets.INTEGRATIONS_SECRET_ARN }}
         run: |
@@ -121,8 +135,14 @@ jobs:
           echo "OPENROUTER_API_KEY=${KEY}" >> "$GITHUB_ENV"
           echo "have_key=true" >> "$GITHUB_OUTPUT"
 
+      - name: Set have_key for US-only mode (no OpenRouter key read)
+        id: creds-usonly
+        if: steps.ctx.outputs.skip != 'true' && vars.CICD_US_ONLY == 'true'
+        run: |
+          echo "have_key=true" >> "$GITHUB_OUTPUT"
+
       - name: Collect PR changes
-        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true'
+        if: steps.ctx.outputs.skip != 'true' && (steps.creds.outputs.have_key == 'true' || steps.creds-usonly.outputs.have_key == 'true')
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}
@@ -154,14 +174,20 @@ jobs:
 
       - name: Run vision design review
         id: review
-        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true'
+        if: steps.ctx.outputs.skip != 'true' && (steps.creds.outputs.have_key == 'true' || steps.creds-usonly.outputs.have_key == 'true')
         env:
           # OPENROUTER_API_KEY comes from GITHUB_ENV (set by the creds step)
           DESIGN_QA_MODEL: ${{ vars.DESIGN_QA_MODEL || 'z-ai/glm-5v-turbo' }}
+          CICD_US_ONLY: ${{ vars.CICD_US_ONLY }}
+          BEDROCK_REGION: us-east-2
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ISSUE_NUMBER: ${{ steps.ctx.outputs.issue_number }}
         run: |
-          pip install --quiet requests
+          pip install --quiet requests boto3 pillow
           python3 - << 'PYEOF'
           import json, os, re, sys
+          import io
           import requests
 
           issue_body = open('.design-qa/issue-body.md', encoding='utf-8').read()
@@ -192,6 +218,245 @@ jobs:
               f"===== DIFF =====\n{changes}"
           )
 
+          us_only = os.environ.get("CICD_US_ONLY") == "true"
+
+          def parse_verdict(raw):
+              # Returns the parsed verdict dict, or None when the output is
+              # unparseable (no valid JSON and no {...} block). Callers decide
+              # how to treat unparseable output (OpenRouter passes through;
+              # US-only escalates).
+              if raw.startswith("```"):
+                  raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+              try:
+                  return json.loads(raw)
+              except json.JSONDecodeError:
+                  m = re.search(r"\{.*\}", raw, re.DOTALL)
+                  if m:
+                      try:
+                          return json.loads(m.group(0))
+                      except json.JSONDecodeError:
+                          return None
+                  return None
+
+          def write_usage(model_used, prompt_tokens, completion_tokens, cached_tokens, cost, tier=None):
+              usage_record = {
+                  "role": "design_qa",
+                  "model": model_used,
+                  "repo": os.environ.get("GITHUB_REPOSITORY", ""),
+                  "prNumber": os.environ.get("PR_NUMBER", ""),
+                  "issueNumber": os.environ.get("ISSUE_NUMBER", ""),
+                  "promptTokens": prompt_tokens,
+                  "completionTokens": completion_tokens,
+                  "cachedTokens": cached_tokens,
+                  "estimatedCostUsd": cost,
+              }
+              if tier is not None:
+                  usage_record["tier"] = tier
+              # usage.json is a list of records (one per model call).
+              path = '.design-qa/usage.json'
+              records = []
+              if os.path.exists(path):
+                  try:
+                      records = json.load(open(path))
+                      if not isinstance(records, list):
+                          records = [records]
+                  except Exception:
+                      records = []
+              records.append(usage_record)
+              json.dump(records, open(path, 'w'))
+              print("LLM_USAGE", json.dumps(usage_record, sort_keys=True))
+
+          def finish(verdict):
+              json.dump(verdict, open('.design-qa/verdict.json', 'w'))
+              out = os.environ.get("GITHUB_OUTPUT")
+              with open(out, "a") as f:
+                  f.write(f"pass={'true' if verdict.get('pass') else 'false'}\n")
+              print("VERDICT:", json.dumps(verdict, indent=2))
+
+          if us_only:
+              # ---- US-only mode: Bedrock Converse, NEVER OpenRouter ----
+              import boto3
+              from botocore.config import Config
+              from botocore.exceptions import ClientError
+
+              region = os.environ.get("BEDROCK_REGION", "us-east-2")
+              if region not in ("us-east-1", "us-east-2", "us-west-2"):
+                  print("US_ONLY_VIOLATION", json.dumps({"region": region}))
+                  sys.exit(1)
+
+              def sniff_format(headers, data):
+                  ct = (headers.get("Content-Type") or "").lower()
+                  for fmt in ("png", "jpeg", "gif", "webp"):
+                      if fmt in ct:
+                          return fmt
+                  if data[:8] == b"\x89PNG\r\n\x1a\n":
+                      return "png"
+                  if data[:3] == b"\xff\xd8\xff":
+                      return "jpeg"
+                  if data[:6] in (b"GIF87a", b"GIF89a"):
+                      return "gif"
+                  if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                      return "webp"
+                  return "png"
+
+              def resize_image_if_needed(data, url, original_format):
+                  # Bedrock rejects single images over 5 MB; keep a safe margin.
+                  if len(data) <= 4_500_000:
+                      return data, original_format
+                  from PIL import Image
+                  img = Image.open(io.BytesIO(data))
+                  img.load()
+                  # Flatten any alpha onto a white background.
+                  if img.mode in ("RGBA", "LA", "P"):
+                      rgba = img.convert("RGBA")
+                      background = Image.new("RGB", rgba.size, (255, 255, 255))
+                      background.paste(rgba, mask=rgba.split()[-1])
+                      img = background
+                  else:
+                      img = img.convert("RGB")
+                  # Cap the longest edge at 8000 px.
+                  max_edge = max(img.size)
+                  if max_edge > 8000:
+                      scale = 8000.0 / max_edge
+                      img = img.resize((int(img.width * scale), int(img.height * scale)), Image.LANCZOS)
+                  quality = 85
+                  while True:
+                      buf = io.BytesIO()
+                      img.save(buf, format="JPEG", quality=quality)
+                      new_bytes = buf.getvalue()
+                      if len(new_bytes) <= 4_500_000:
+                          break
+                      if quality > 55:
+                          quality -= 10
+                          continue
+                      # Quality floor reached; scale down and retry.
+                      img = img.resize((int(img.width * 0.8), int(img.height * 0.8)), Image.LANCZOS)
+                      quality = 85
+                  print(f'DESIGN_QA_IMAGE_RESIZED {{"url": "{url}", "from_bytes": {len(data)}, "to_bytes": {len(new_bytes)}}}')
+                  return new_bytes, "jpeg"
+
+              # Download reference images (max 3) as bytes; retry GitHub
+              # attachment hosts once with the runner token.
+              image_blocks = []
+              for url in images:
+                  data = None
+                  resp_headers = {}
+                  for attempt in (0, 1):
+                      headers = {}
+                      if attempt == 1:
+                          headers["Authorization"] = f"Bearer {os.environ.get('GITHUB_TOKEN', '')}"
+                      try:
+                          r = requests.get(url, headers=headers, timeout=30)
+                          r.raise_for_status()
+                          data = r.content
+                          resp_headers = r.headers
+                          break
+                      except Exception as e:
+                          print(f"WARNING: image download failed (attempt {attempt+1}): {url} — {e}")
+                  if data is None:
+                      print(f"WARNING: skipping undownloadable image: {url}")
+                      continue
+                  fmt = sniff_format(resp_headers, data)
+                  try:
+                      data, fmt = resize_image_if_needed(data, url, fmt)
+                  except Exception as e:
+                      print(f"WARNING: skipping unreadable image: {url} — {e}")
+                      continue
+                  image_blocks.append({"image": {"format": fmt, "source": {"bytes": data}}})
+              if not image_blocks:
+                  print("WARNING: no reference images could be downloaded — passing through.")
+                  finish({"pass": True, "summary": "No reference images could be downloaded — passing through.", "mismatches": []})
+                  sys.exit(0)
+
+              content = image_blocks + [{"text": prompt}]
+
+              # Fixed two-tier review (decision made once by the benchmark, not a
+              # per-repo setting): Haiku 5.5 first, then Sonnet 5.5 only when
+              # Haiku does not return a clean PASS.
+              PRIMARY_MODEL = "us.anthropic.claude-haiku-5-5"
+              ESCALATION_MODEL = "us.anthropic.claude-sonnet-5-5"
+              # Effective us-east-2 rates (USD per 1M tokens).
+              DESIGN_QA_RATES_PER_1M = {
+                  "us.anthropic.claude-haiku-5-5": {"input": 0.11, "output": 0.55},
+                  "us.anthropic.claude-sonnet-5-5": {"input": 2.20, "output": 11.00},
+              }
+
+              client = boto3.client("bedrock-runtime", region_name=region, config=Config(retries={"max_attempts": 2}))
+
+              def write_skip_comment(msg):
+                  with open('.design-qa/skip-comment.txt', 'w') as f:
+                      f.write("<!-- AGENT_DESIGN_QA --> Design QA skipped: " + msg)
+
+              def converse_once(model_id, tier):
+                  # Exactly one Converse call; records usage and returns the raw
+                  # text, or {"error": ...} on failure.
+                  try:
+                      resp = client.converse(
+                          modelId=model_id,
+                          messages=[{"role": "user", "content": content}],
+                          inferenceConfig={"maxTokens": 1500},
+                      )
+                  except ClientError as e:
+                      return {"error": e, "code": (e.response.get("Error") or {}).get("Code")}
+                  except Exception as e:
+                      return {"error": e, "code": None}
+                  usage = resp.get("usage") or {}
+                  prompt_tokens = int(usage.get("inputTokens") or 0)
+                  completion_tokens = int(usage.get("outputTokens") or 0)
+                  cached_tokens = int(usage.get("cacheReadInputTokens") or 0) + int(usage.get("cacheWriteInputTokens") or 0)
+                  rate = DESIGN_QA_RATES_PER_1M.get(model_id)
+                  cost = None if rate is None else round(prompt_tokens / 1e6 * rate["input"] + completion_tokens / 1e6 * rate["output"], 6)
+                  write_usage(model_id, prompt_tokens, completion_tokens, cached_tokens, cost, tier)
+                  # Join every text block; the first block may be non-text (e.g. reasoningContent).
+                  try:
+                      blocks = ((resp.get("output") or {}).get("message") or {}).get("content") or []
+                      raw = "".join(b["text"] for b in blocks if isinstance(b, dict) and isinstance(b.get("text"), str)).strip()
+                      print("DESIGN_QA_BLOCK_TYPES", json.dumps([sorted(b.keys()) for b in blocks if isinstance(b, dict)]))
+                  except Exception as e:
+                      return {"error": e, "code": None}
+                  return {"raw": raw}
+
+              primary = converse_once(PRIMARY_MODEL, "primary")
+              if "error" in primary:
+                  if primary["code"] == "ValidationException":
+                      # Fail closed: no OpenRouter fallback. Pass the PR through
+                      # and leave a visible skip comment so the gap is not silent.
+                      print("US_ONLY_VIOLATION", json.dumps({"error": str(primary["error"])}))
+                      write_skip_comment("Bedrock rejected the request (ValidationException) " + str(primary["error"])[:200])
+                      sys.exit(0)
+                  # Non-ValidationException error -> escalate once.
+                  escalate_reason = "error"
+                  primary_desc = str(primary["error"])[:200]
+              else:
+                  primary_verdict = parse_verdict(primary["raw"])
+                  if primary_verdict is not None and primary_verdict.get("pass") is True:
+                      finish(primary_verdict)
+                      sys.exit(0)
+                  if primary_verdict is None:
+                      escalate_reason = "unparseable"
+                      primary_desc = primary["raw"][:200]
+                  else:
+                      escalate_reason = "fail"
+                      primary_desc = primary["raw"][:200]
+
+              # Escalation: exactly one more Converse call on ESCALATION_MODEL.
+              print("DESIGN_QA_ESCALATED", json.dumps({"reason": escalate_reason, "primary": primary_desc, "escalation": ESCALATION_MODEL}))
+              esc = converse_once(ESCALATION_MODEL, "escalation")
+              if "error" in esc:
+                  # Fail closed: no OpenRouter fallback. Pass the PR through and
+                  # leave a visible skip comment so the gap is not silent.
+                  print("US_ONLY_VIOLATION", json.dumps({"error": str(esc["error"])}))
+                  write_skip_comment("Bedrock unavailable in US-only mode")
+                  sys.exit(0)
+              esc_verdict = parse_verdict(esc["raw"])
+              if esc_verdict is None:
+                  # Unparseable escalation output -> silent pass-through.
+                  finish({"pass": True, "summary": "Unparseable review output — passing through.", "mismatches": []})
+                  sys.exit(0)
+              finish(esc_verdict)
+              sys.exit(0)
+
+          # ---- Default (CICD_US_ONLY unset/false): OpenRouter ----
           content = [{"type": "text", "text": prompt}]
           for url in images:
               content.append({"type": "image_url", "image_url": {"url": url}})
@@ -207,24 +472,71 @@ jobs:
               timeout=120,
           )
           resp.raise_for_status()
-          raw = resp.json()["choices"][0]["message"]["content"].strip()
-          if raw.startswith("```"):
-              raw = raw.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-          try:
-              verdict = json.loads(raw)
-          except json.JSONDecodeError:
-              m = re.search(r"\{.*\}", raw, re.DOTALL)
-              verdict = json.loads(m.group(0)) if m else {"pass": True, "summary": "Unparseable review output — passing through.", "mismatches": []}
-
-          json.dump(verdict, open('.design-qa/verdict.json', 'w'))
-          out = os.environ.get("GITHUB_OUTPUT")
-          with open(out, "a") as f:
-              f.write(f"pass={'true' if verdict.get('pass') else 'false'}\n")
-          print("VERDICT:", json.dumps(verdict, indent=2))
+          body_json = resp.json()
+          usage = body_json.get("usage") or {}
+          usage_details = usage.get("prompt_tokens_details") or {}
+          prompt_tokens = int(usage.get("prompt_tokens") or 0)
+          completion_tokens = int(usage.get("completion_tokens") or 0)
+          model_used = os.environ.get("DESIGN_QA_MODEL", "z-ai/glm-5v-turbo")
+          # USD per 1M tokens (input/output) keyed by model; unknown model -> null cost.
+          DESIGN_QA_RATES_PER_1M = {}
+          rate = DESIGN_QA_RATES_PER_1M.get(model_used)
+          cost = None if rate is None else round(prompt_tokens / 1e6 * rate["input"] + completion_tokens / 1e6 * rate["output"], 6)
+          write_usage(model_used, prompt_tokens, completion_tokens, int(usage_details.get("cached_tokens") or 0), cost)
+          raw = body_json["choices"][0]["message"]["content"].strip()
+          verdict = parse_verdict(raw)
+          if verdict is None:
+              verdict = {"pass": True, "summary": "Unparseable review output — passing through.", "mismatches": []}
+          finish(verdict)
           PYEOF
 
+      - name: Post US-only Bedrock-unavailable skip comment
+        if: steps.ctx.outputs.skip != 'true' && (steps.creds.outputs.have_key == 'true' || steps.creds-usonly.outputs.have_key == 'true')
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('.design-qa/skip-comment.txt')) {
+              core.info('No US-only skip comment needed.');
+              return;
+            }
+            const body = fs.readFileSync('.design-qa/skip-comment.txt', 'utf-8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+      - name: Publish design QA usage metrics (CloudWatch)
+        if: always() && steps.ctx.outputs.skip != 'true' && (steps.creds.outputs.have_key == 'true' || steps.creds-usonly.outputs.have_key == 'true')
+        continue-on-error: true
+        shell: bash
+        run: |
+          if [ ! -f .design-qa/usage.json ]; then
+            echo "No design QA usage record; nothing to publish."
+            exit 0
+          fi
+          jq -c '
+            (if type == "array" then . else [.] end) as $records
+            | $records
+            | map(
+                . as $u
+                | [ {MetricName:"InputTokens",Value:$u.promptTokens,Unit:"Count"},
+                    {MetricName:"OutputTokens",Value:$u.completionTokens,Unit:"Count"},
+                    {MetricName:"Calls",Value:1,Unit:"Count"} ]
+                  + (if $u.estimatedCostUsd != null then [{MetricName:"EstimatedCostUsd",Value:$u.estimatedCostUsd,Unit:"None"}] else [] end)
+                | map(. + {Dimensions:[{Name:"Role",Value:"design_qa"},{Name:"Model",Value:$u.model}]})
+              )
+            | add
+          ' .design-qa/usage.json > /tmp/design-qa-metrics.json
+          aws cloudwatch put-metric-data \
+            --region us-east-2 \
+            --namespace DSG/CICD \
+            --metric-data file:///tmp/design-qa-metrics.json
+
       - name: Post pass comment
-        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true' && steps.review.outputs.pass == 'true'
+        if: steps.ctx.outputs.skip != 'true' && (steps.creds.outputs.have_key == 'true' || steps.creds-usonly.outputs.have_key == 'true') && steps.review.outputs.pass == 'true'
         uses: actions/github-script@v7
         with:
           github-token: ${{ github.token }}
@@ -240,7 +552,7 @@ jobs:
 
       - name: Generate commenter app token
         id: commenter-token
-        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true' && steps.review.outputs.pass == 'false'
+        if: steps.ctx.outputs.skip != 'true' && (steps.creds.outputs.have_key == 'true' || steps.creds-usonly.outputs.have_key == 'true') && steps.review.outputs.pass == 'false'
         continue-on-error: true
         uses: actions/create-github-app-token@v1
         with:
@@ -248,7 +560,7 @@ jobs:
           private-key: ${{ secrets.DSG_COMMENTER_PRIVATE_KEY }}
 
       - name: Request changes with mismatches
-        if: steps.ctx.outputs.skip != 'true' && steps.creds.outputs.have_key == 'true' && steps.review.outputs.pass == 'false'
+        if: steps.ctx.outputs.skip != 'true' && (steps.creds.outputs.have_key == 'true' || steps.creds-usonly.outputs.have_key == 'true') && steps.review.outputs.pass == 'false'
         uses: actions/github-script@v7
         with:
           # Review must come from dsg-commenter[bot]: it is allow-listed in
