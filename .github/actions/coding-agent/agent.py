@@ -5,7 +5,12 @@ Replaces anthropics/claude-code-action@v1 with a provider-agnostic agentic
 coding loop. Uses any OpenAI-compatible API (DeepSeek, OpenAI, etc).
 
 Environment variables (set by the composite action):
-    AGENT_API_KEY         — API key for the LLM provider
+    AGENT_PROVIDER        — "openai" (default, any OpenAI-compatible API) or "bedrock"
+                            (AWS Bedrock Converse via bedrock_client.py; US-only, uses the
+                            runner's AWS credentials, no API key needed)
+    AGENT_BEDROCK_REGION  — Bedrock region (default: us-east-2); model IDs must be us.* /
+                            in-region IDs, never global.*
+    AGENT_API_KEY         — API key for the LLM provider (not used when AGENT_PROVIDER=bedrock)
     AGENT_API_BASE_URL    — Base URL (default: https://openrouter.ai/api/v1)
     AGENT_MODEL           — Model name (default: deepseek/deepseek-v4-flash-0731)
     AGENT_ESCALATION_MODEL — Model to escalate to on no_progress (default: deepseek/deepseek-v4-pro)
@@ -42,8 +47,20 @@ VERSION = "0.1.0"
 # Configuration
 # ---------------------------------------------------------------------------
 
-API_KEY = os.environ["AGENT_API_KEY"]
+AGENT_PROVIDER = os.environ.get("AGENT_PROVIDER", "openai").strip().lower()
+if AGENT_PROVIDER not in ("openai", "bedrock"):
+    raise SystemExit(f"Unsupported AGENT_PROVIDER: {AGENT_PROVIDER!r} (expected 'openai' or 'bedrock')")
+# The key is only needed for OpenAI-compatible providers; Bedrock uses AWS credentials.
+API_KEY = os.environ["AGENT_API_KEY"] if AGENT_PROVIDER == "openai" else os.environ.get("AGENT_API_KEY", "")
 API_BASE_URL = os.environ.get("AGENT_API_BASE_URL", "https://openrouter.ai/api/v1")
+# Provider-appropriate model defaults. Bedrock needs explicit Bedrock model IDs
+# (e.g. us.anthropic.claude-haiku-5-5, zai.glm-5); set AGENT_MODEL for real use.
+if AGENT_PROVIDER == "bedrock":
+    DEFAULT_MODEL = "zai.glm-5"
+    DEFAULT_ESCALATION_MODEL = "zai.glm-5"
+else:
+    DEFAULT_MODEL = "deepseek/deepseek-v4-flash-0731"
+    DEFAULT_ESCALATION_MODEL = "deepseek/deepseek-v4-pro"
 ISSUE_CONTEXT_PATH = os.environ["AGENT_ISSUE_CONTEXT"]
 BRANCH_NAME = os.environ["AGENT_BRANCH_NAME"]
 ISSUE_NUMBER = os.environ["AGENT_ISSUE_NUMBER"]
@@ -53,23 +70,53 @@ AGENT_MODE = os.environ.get("AGENT_MODE", "implement")
 AGENT_REVIEW_CONCERNS = os.environ.get("AGENT_REVIEW_CONCERNS", "")
 AGENT_REQUIRED_FILES = os.environ.get("AGENT_REQUIRED_FILES", "*")
 
+# Write-progress and escalation configuration (see SECURITY.md rationale).
+# WRITE_THRESHOLD_PCT: if no write has happened by this percent of max_turns,
+# the agent escalates to AGENT_ESCALATION_MODEL.
+WRITE_THRESHOLD_PCT = int(os.environ.get("AGENT_WRITE_THRESHOLD_PCT", "60"))
+# TURNS_PER_FILE: additional turns granted per required file beyond the first.
+TURNS_PER_FILE = int(os.environ.get("AGENT_TURNS_PER_FILE", "8"))
+# FIRST_WRITE_BY_TURN: hard deadline for producing the first write/edit in revise
+# mode; used in the system prompt to force early progress.
+FIRST_WRITE_BY_TURN = int(os.environ.get("AGENT_FIRST_WRITE_BY_TURN", "8"))
+# Up-front file content injection caps for revise mode (chars). Per-file cap
+# prevents a single huge file from dominating the prompt; the total cap bounds
+# the whole injection block. Truncated files are marked in the prompt.
+INJECT_PER_FILE_CAP = int(os.environ.get("AGENT_INJECT_PER_FILE_CAP", "12000"))
+INJECT_TOTAL_CAP = int(os.environ.get("AGENT_INJECT_TOTAL_CAP", "40000"))
+
 # Context budget for the message window. When total serialized chars exceed
-# this, _compact_messages() reclaims space (~45K tokens, approaching 64K limit).
-CONTEXT_BUDGET_CHARS = 180_000
+# this, _compact_messages() reclaims space down to
+# COMPACT_TARGET_RATIO * CONTEXT_BUDGET_CHARS (headroom so the next few tool
+# results do not immediately re-trigger compaction on the following turn).
+# Tunable per workflow via the AGENT_CONTEXT_BUDGET_CHARS env var; the default
+# 300000 chars (~75K tokens) is safe for any model with a 128K+ token window.
+CONTEXT_BUDGET_CHARS = int(os.environ.get("AGENT_CONTEXT_BUDGET_CHARS", "300000"))
+# Compact to this fraction of the budget so compaction does not run every turn.
+COMPACT_TARGET_RATIO = 0.6
+# The most recent tool messages (and the assistant messages that issued them)
+# are never truncated or dropped, so freshly-read file content survives
+# compaction long enough to be reproduced in an edit_file(old_text=...) call.
+PROTECTED_RECENT_TOOL_MESSAGES = 8
+# Truncation limits for OLDER tool messages (phases 1 and 2 of compaction).
+OLDER_TOOL_LIMIT_PHASE1 = 6000
+OLDER_TOOL_LIMIT_PHASE2 = 1500
 
 # Per-request timeout for the OpenAI client, in seconds. DeepSeek V4 Flash's
 # best-provider P50 latency is ~0.41s and even long tool-loaded prompts
-# complete well under a minute; anything past 3 minutes is almost certainly a
+# complete well under a minute; anything past 90s is almost certainly a
 # stalled OpenRouter provider connection worth aborting so the existing retry
 # loop can land on a different provider. Without this timeout a silent stall
 # (no response, no error) would hang the agent until the job-level timeout.
-API_REQUEST_TIMEOUT = 180.0
+# Tunable via AGENT_API_REQUEST_TIMEOUT.
+API_REQUEST_TIMEOUT = float(os.environ.get("AGENT_API_REQUEST_TIMEOUT", "90"))
 
 # Per-turn wall clock timeout (seconds). Wraps the entire turn body — API call
 # plus tool execution — so no single turn can hang indefinitely regardless of
 # what stalls. Must exceed API_REQUEST_TIMEOUT to allow at least one full API
-# attempt before the alarm fires.
-TURN_WALL_CLOCK_TIMEOUT = 240  # 4 minutes (exceeds API_REQUEST_TIMEOUT by 60s)
+# attempt before the alarm fires. A turn includes tool execution (bash, git),
+# so the default is not lowered below 120s. Tunable via AGENT_TURN_TIMEOUT.
+TURN_WALL_CLOCK_TIMEOUT = int(os.environ.get("AGENT_TURN_TIMEOUT", "150"))  # 2.5 minutes (exceeds API_REQUEST_TIMEOUT by 60s)
 
 # No-progress detection: hard-stop when the agent burns too many turns without
 # any edit_file/write_file call (e.g. an endless successful-but-non-writing
@@ -81,6 +128,290 @@ TURN_WALL_CLOCK_TIMEOUT = 240  # 4 minutes (exceeds API_REQUEST_TIMEOUT by 60s)
 NO_PROGRESS_THRESHOLD = 25
 NO_PROGRESS_GRACE_TURNS = 30
 NO_PROGRESS_NUDGE_AT = 15
+
+# ---------------------------------------------------------------------------
+# LLM usage tracking (issue #980)
+#
+# Records per-call and per-run token usage so runner model spend is trackable
+# in CloudWatch next to the Lambda-side usage logged by the compute service
+# (dsg-agentic-assistant-compute#594, message `llm_usage`). This changes no
+# model, provider or prompt — it only reads response.usage and logs it.
+# The call function is kept provider-neutral because it will later be replaced
+# by a Bedrock adapter.
+# ---------------------------------------------------------------------------
+
+# Per-model USD rates per 1M tokens (input / output). Seeded with the models
+# the coding agent uses; an unknown model reports estimatedCostUsd: null and
+# never raises. Optional "cached" rate prices cache-read input tokens and
+# "cache_write" prices cache-write input tokens (default for both: the normal
+# input rate). Haiku 5.5 bills in two tiers chosen per request: requests with
+# <= threshold_tokens prompt tokens use the standard rates below; requests
+# with more bill EVERY token of that request at the "long_context" rates
+# (Anthropic pricing page; both usage types appear on our Bedrock bill).
+# The Bedrock rates are AWS Cost Explorer effective rates (us-east-2, billed
+# usage, checked 2026-11-14, issue #990).
+MODEL_RATES_PER_1M: dict[str, dict[str, float | int | dict[str, float | int]]] = {
+    "deepseek/deepseek-v4-flash-0731": {"input": 0.14, "output": 0.28},
+    "deepseek/deepseek-v4-pro": {"input": 1.25, "output": 2.50},
+    "zai.glm-5": {"input": 1.0, "output": 3.2},
+    "zai.glm-4.7": {"input": 0.6, "output": 2.2},
+    "zai.glm-4.7-flash": {"input": 0.07, "output": 0.4},
+    "us.anthropic.claude-haiku-5-5": {
+        "input": 0.11,
+        "output": 0.55,
+        "cached": 0.011,
+        "cache_write": 0.1375,
+        "long_context": {
+            "input": 0.55,
+            "output": 2.75,
+            "cached": 0.055,
+            "cache_write": 0.6875,
+            "threshold_tokens": 100_000,
+        },
+    },
+    "us.anthropic.claude-sonnet-5-5": {
+        "input": 2.2,
+        "output": 11.0,
+        "cached": 0.11,
+        "cache_write": 2.75,
+    },
+}
+
+# Per-model accumulated run totals:
+#   model -> {"calls": int, "promptTokens": int, "completionTokens": int,
+#             "cachedTokens": int, "cacheWriteTokens": int,
+#             "estimatedCostUsd": float, "longContextCalls": int,
+#             "maxPromptTokens": int}
+# Escalation can swap the model mid-run, so totals are kept per model.
+USAGE_STATE: dict[str, dict[str, int | float]] = {}
+
+
+def _usage_totals(model: str) -> dict[str, int | float]:
+    return USAGE_STATE.setdefault(
+        model,
+        {
+            "calls": 0,
+            "promptTokens": 0,
+            "completionTokens": 0,
+            "cachedTokens": 0,
+            "cacheWriteTokens": 0,
+            "estimatedCostUsd": 0.0,
+            "longContextCalls": 0,
+            "maxPromptTokens": 0,
+        },
+    )
+
+
+def _cache_write_tokens(usage) -> int:
+    """Cache-write input tokens from a Bedrock response usage; 0 when absent."""
+    return int(getattr(usage, "cache_write_tokens", 0) or 0)
+
+
+def _uses_long_context_tier(model: str, prompt_size: int) -> bool:
+    """True when prompt_size (input + cache read + cache write) exceeds the
+    model's long-context threshold, so every token of the call is billed at
+    the long-context rates. ASSUMPTION (issue #990): cache tokens count toward
+    the 100K threshold; AWS docs do not state this either way, but Cost
+    Explorer lists long-context cache usage that way, so we follow it."""
+    long_context = MODEL_RATES_PER_1M.get(model, {}).get("long_context")
+    return long_context is not None and prompt_size > long_context.get(
+        "threshold_tokens", 0
+    )
+
+
+def estimated_cost_usd(
+    model: str,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float | None:
+    """Estimate USD cost for a single API call; None when the rate is unknown.
+
+    prompt_tokens is the call's non-cached input token count (Bedrock
+    ``inputTokens``; for OpenAI-compatible providers that is the reported
+    ``usage.prompt_tokens`` minus ``cached_tokens``). cached_tokens and
+    cache_write_tokens are the cache-read and cache-write input tokens
+    (default 0); the call's total prompt size is the sum of the three.
+
+    When the model defines a ``long_context`` tier and the call's prompt size
+    exceeds ``threshold_tokens``, every token of that call — input, output,
+    cache read and cache write — is priced at the long-context rates.
+    """
+    rate = MODEL_RATES_PER_1M.get(model)
+    if rate is None:
+        return None
+    input_tokens = max(prompt_tokens, 0)
+    completion_tokens = max(completion_tokens, 0)
+    cached = max(cached_tokens, 0)
+    cache_write = max(cache_write_tokens, 0)
+    prompt_size = input_tokens + cached + cache_write
+
+    if _uses_long_context_tier(model, prompt_size):
+        rate = rate["long_context"]
+    cached_rate = rate.get("cached", rate["input"])
+    cache_write_rate = rate.get("cache_write", rate["input"])
+    return (
+        (input_tokens / 1_000_000) * rate["input"]
+        + (cached / 1_000_000) * cached_rate
+        + (cache_write / 1_000_000) * cache_write_rate
+        + (completion_tokens / 1_000_000) * rate["output"]
+    )
+
+
+def _usage_counts(usage) -> tuple[int, int, int]:
+    """Extract (prompt, completion, cached) token counts, defaulting missing fields to 0."""
+    if usage is None:
+        return 0, 0, 0
+    prompt_tokens = int(getattr(usage, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(usage, "completion_tokens", 0) or 0)
+    # OpenAI-compatible providers expose cached tokens as
+    # usage.prompt_tokens_details.cached_tokens; 0 when absent.
+    cached_tokens = 0
+    details = getattr(usage, "prompt_tokens_details", None)
+    if details is not None:
+        cached_tokens = int(getattr(details, "cached_tokens", 0) or 0)
+    return prompt_tokens, completion_tokens, cached_tokens
+
+
+def record_usage(model: str, usage) -> None:
+    """Accumulate one completion call's token totals and per-call cost into USAGE_STATE.
+
+    Cost is computed per API call (not from run totals) because Haiku 5.5's
+    long-context tier depends on each call's individual prompt size (issue #990).
+    """
+    prompt_tokens, completion_tokens, cached_tokens = _usage_counts(usage)
+    cache_write_tokens = _cache_write_tokens(usage)
+    totals = _usage_totals(model)
+    totals["calls"] += 1
+    totals["promptTokens"] += prompt_tokens
+    totals["completionTokens"] += completion_tokens
+    totals["cachedTokens"] += cached_tokens
+    totals["cacheWriteTokens"] += cache_write_tokens
+
+    # Non-cached input is what Bedrock reports as inputTokens; for
+    # OpenAI-compatible providers prompt_tokens already includes the cached
+    # tokens, so subtract them to avoid double-charging.
+    input_tokens = max(prompt_tokens - cached_tokens - cache_write_tokens, 0)
+    prompt_size = input_tokens + cached_tokens + cache_write_tokens
+    totals["maxPromptTokens"] = max(totals["maxPromptTokens"], prompt_size)
+    cost = estimated_cost_usd(
+        model, input_tokens, completion_tokens, cached_tokens, cache_write_tokens
+    )
+    if cost is not None:
+        totals["estimatedCostUsd"] += cost
+        if _uses_long_context_tier(model, prompt_size):
+            totals["longContextCalls"] += 1
+
+
+def print_llm_usage(model: str, turn: int, usage, duration_ms: float, finish_reason: str | None) -> None:
+    """Print one JSON line per LLM call to stdout, prefixed 'LLM_USAGE '.
+
+    Field names match the Lambda-side schema (dsg-agentic-assistant-compute#594).
+    Never logs message content.
+    """
+    prompt_tokens, completion_tokens, cached_tokens = _usage_counts(usage)
+    cache_write_tokens = _cache_write_tokens(usage)
+    record_usage(model, usage)
+    input_tokens = max(prompt_tokens - cached_tokens - cache_write_tokens, 0)
+    prompt_size = input_tokens + cached_tokens + cache_write_tokens
+    payload = {
+        "role": "coding_agent",
+        "mode": AGENT_MODE,
+        "model": model,
+        "turn": turn,
+        "promptTokens": prompt_tokens,
+        "completionTokens": completion_tokens,
+        "cachedTokens": cached_tokens,
+        "cacheWriteTokens": cache_write_tokens,
+        "maxPromptTokens": prompt_size,
+        "longContextCalls": 1 if _uses_long_context_tier(model, prompt_size) else 0,
+        "durationMs": int(duration_ms),
+        "finishReason": finish_reason,
+    }
+    print(f"LLM_USAGE {json.dumps(payload, sort_keys=True)}", flush=True)
+
+
+def build_usage_summary() -> dict:
+    """Per-model totals plus run metadata for the LLM_USAGE_SUMMARY line."""
+    models = []
+    total_calls = 0
+    total_cost = 0.0
+    any_known = False
+    for model, totals in USAGE_STATE.items():
+        # Per-call costs are accumulated in record_usage (the long-context
+        # tier is decided per call, so run totals can't be priced in bulk).
+        cost = totals["estimatedCostUsd"]
+        if MODEL_RATES_PER_1M.get(model) is None:
+            cost = None
+        if cost is not None:
+            total_cost += cost
+            any_known = True
+        models.append({
+            "model": model,
+            "calls": totals["calls"],
+            "promptTokens": totals["promptTokens"],
+            "completionTokens": totals["completionTokens"],
+            "cachedTokens": totals["cachedTokens"],
+            "cacheWriteTokens": totals["cacheWriteTokens"],
+            "longContextCalls": totals["longContextCalls"],
+            "maxPromptTokens": totals["maxPromptTokens"],
+            "estimatedCostUsd": cost,
+        })
+        total_calls += totals["calls"]
+    models.sort(key=lambda m: m["model"])
+    return {
+        "role": "coding_agent",
+        "mode": AGENT_MODE,
+        "repo": os.environ.get("GITHUB_REPOSITORY", ""),
+        "issueNumber": ISSUE_NUMBER,
+        "runId": os.environ.get("GITHUB_RUN_ID", ""),
+        "models": models,
+        "totalCalls": total_calls,
+        "estimatedCostUsd": round(total_cost, 6) if any_known else None,
+    }
+
+
+def print_usage_summary() -> None:
+    """Print the LLM_USAGE_SUMMARY line, set the usage-json output and append
+    a small cost table to $GITHUB_STEP_SUMMARY. Never raises."""
+    try:
+        summary = build_usage_summary()
+    except Exception as e:
+        log(f"Failed to build LLM usage summary: {e}")
+        return
+
+    print(f"LLM_USAGE_SUMMARY {json.dumps(summary, sort_keys=True)}", flush=True)
+
+    try:
+        set_output("usage-json", json.dumps(summary, sort_keys=True))
+    except Exception as e:
+        log(f"Failed to write usage-json output: {e}")
+
+    summary_file = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_file:
+        return
+    try:
+        rows = []
+        for m in summary["models"]:
+            cost = m["estimatedCostUsd"]
+            cost_str = f"${cost:.6f}" if cost is not None else "n/a"
+            rows.append(
+                f"| {m['model']} | {m['calls']} | {m['promptTokens']} | "
+                f"{m['completionTokens']} | {cost_str} |"
+            )
+        table = (
+            "## LLM Usage Summary\n\n"
+            "| Model | Calls | Input tokens | Output tokens | Estimated cost (USD) |\n"
+            "|---|---|---|---|---|\n"
+            + "\n".join(rows)
+            + "\n"
+        )
+        with open(summary_file, "a", encoding="utf-8") as f:
+            f.write(table)
+    except Exception as e:
+        log(f"Failed to append LLM usage table to job summary: {e}")
+
 
 class TurnTimeoutError(Exception):
     """Raised when a single agentic turn exceeds TURN_WALL_CLOCK_TIMEOUT."""
@@ -232,6 +563,10 @@ HARD REQUIREMENTS:
 - NEVER use `python3 -c` or `python -c` to validate file changes. The runner shell is dash on Ubuntu and cannot handle nested parentheses in -c one-liners, which causes stuck retry loops. To verify a change landed, use `read_file` or `grep_search` instead. Once `grep_search` confirms the expected content is present, commit and stop — do not attempt further validation.
 - If the issue body or approved plan specifies exact line numbers for a file you need to modify, skip the repository surveying step. Use read_file_lines to read ONLY those line ranges, then call edit_file immediately. Do not read the file from the top — you will waste turns on large files and trigger the no-progress detector.
 
+FIRST WRITE DEADLINE: You MUST produce your first file write (edit_file or write_file) by turn {first_write_by_turn}. The turn budget is limited to {max_turns}. If you have not written anything by turn {first_write_by_turn}, STOP reading/grepping and write SOMETHING immediately — even a partial draft, a skeleton file, or a placeholder. Exploration is not progress; only write_file and edit_file count as progress.
+
+NO RE-READ RULE: Do NOT re-read any file that you have already read during this session. Once you have read a file, you already know its contents. Reading it again wastes turns and will cause you to exhaust the turn budget before finishing the required deliverables. This is especially important after context compaction.
+
 STOP RULE: After you have made the requested changes AND (if tests were requested) all specified tests pass, commit and end your turn immediately. Do NOT continue exploring, grepping, or reading files. If you find yourself running grep_search, ls, or read_file after tests have passed, STOP — commit and end.
 
 STOP RULE (TEST IMPORT ERRORS): If you run a test or Python script that fails with importing errors (ModuleNotFoundError, ImportError), STOP. Do NOT retry the same failing test. Instead:
@@ -241,13 +576,15 @@ STOP RULE (TEST IMPORT ERRORS): If you run a test or Python script that fails wi
 Do NOT repeatedly run the same failing test -- this triggers the error-loop detector.
 
 WORKFLOW:
-1. Run `git diff origin/main...HEAD` to understand what this branch has changed.
-2. Run `git log --oneline -10` to see commit history.
-3. For EACH file mentioned in the review concerns, read the CURRENT file content before editing. If the review concerns specify exact line numbers for the changes needed, use read_file_lines to read only those line ranges instead of reading the entire file from the top. Reading large files from the top wastes turns and triggers the no-progress abort.
-4. Read .agent/issue-context.json if present for original issue context.
-5. Address ONLY the review concerns below. Do not refactor or touch anything else.
-6. After editing, verify with `git diff` that changes look correct.
-7. Commit with a message listing the specific files changed and what was changed.
+1. Know the exact files to create/edit from the review concerns AND the required-files section below. These are your targets.
+2. Produce your first write_file or edit_file by turn {first_write_by_turn}. Do not spend early turns exploring — read one or two key files, then write.
+3. Run `git diff origin/main...HEAD` to understand what this branch has changed.
+4. Run `git log --oneline -10` to see commit history.
+5. For EACH file mentioned in the review concerns, read the CURRENT file content before editing. If the review concerns specify exact line numbers for the changes needed, use read_file_lines to read only those line ranges instead of reading the entire file from the top. Reading large files from the top wastes turns and triggers the no-progress abort.
+6. Read .agent/issue-context.json if present for original issue context.
+7. Address ONLY the review concerns below. Do not refactor or touch anything else.
+8. After editing, verify with `git diff` that changes look correct.
+9. Commit with a message listing the specific files changed and what was changed.
 
 LARGE FILE HANDLING:
 If read_file returns a truncated view of a file (you will see a TRUNCATED message), use grep_search to find the exact line numbers of the code you need to modify, then use read_file_lines to read that specific section. This is essential for files over 50,000 characters. Never attempt edit_file on code you have not directly read — the old_text will not match and the edit will fail.
@@ -280,12 +617,96 @@ def build_required_files_section() -> str:
     if not file_list:
         return ""
     return (
-        "CONSTRAINED FILE SCOPE (MUST FOLLOW):\n"
-        "Restrict your changes to ONLY the following files. Do not modify any other "
-        "files unless the review concerns explicitly require it. If the requested "
-        "change cannot be made within these files, say so and stop rather than "
-        "editing unrelated files.\n"
+        "REQUIRED DELIVERABLES (MUST WRITE ALL OF THESE):\n"
+        "The following files are required deliverables. You MUST write each one "
+        "with edit_file or write_file. If a required file does not exist yet, "
+        "create it with write_file. Do not modify any other files unless the "
+        "review concerns explicitly require it. If a requested change cannot be "
+        "made within these files, say so and stop rather than editing unrelated "
+        "files.\n"
         f"{file_list}\n"
+    )
+
+
+def parse_required_files() -> list[str]:
+    """Parse AGENT_REQUIRED_FILES (a JSON-encoded list) into file paths.
+
+    Returns an empty list for the special value "*", empty strings, and
+    unparseable/non-list JSON, meaning "no required files".
+    """
+    if not AGENT_REQUIRED_FILES or AGENT_REQUIRED_FILES == "*":
+        return []
+    try:
+        parsed = json.loads(AGENT_REQUIRED_FILES)
+    except json.JSONDecodeError:
+        log(f"Warning: AGENT_REQUIRED_FILES is not valid JSON: {AGENT_REQUIRED_FILES}")
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [f.strip() for f in parsed if isinstance(f, str) and f.strip()]
+
+
+def compute_effective_max_turns(required_files_list: list[str]) -> int:
+    """Scale max_turns for revise mode based on the number of required files.
+
+    Baseline: 25 turns for 1 file, +TURNS_PER_FILE per additional file, capped
+    at 60. When the required-files list is empty (e.g. "*"), N = 1. Implement
+    mode keeps the workflow-provided MAX_TURNS unchanged.
+    """
+    if AGENT_MODE != "revise":
+        return MAX_TURNS
+    n = len(required_files_list) if required_files_list else 1
+    scaled = 25 + TURNS_PER_FILE * (n - 1)
+    return min(60, max(MAX_TURNS, scaled))
+
+
+def build_injected_file_contents(required_files_list: list[str]) -> str:
+    """Read required files and build the up-front content injection string.
+
+    Injects the current contents of each required file into the initial user
+    message so the agent does not need to discover them with read_file/grep
+    loops. Caps at INJECT_PER_FILE_CAP chars per file and INJECT_TOTAL_CAP chars
+    total; truncated files are marked, and files that do not exist yet are
+    marked "(does not exist yet - create it)".
+    """
+    if not required_files_list:
+        return ""
+    injected_parts: list[str] = []
+    total_injected = 0
+    for fpath in required_files_list:
+        if total_injected >= INJECT_TOTAL_CAP:
+            injected_parts.append(
+                "<file path=\"...\">[remaining files omitted — total injection cap reached]</file>"
+            )
+            break
+        if os.path.isfile(fpath):
+            try:
+                with open(fpath) as _f:
+                    content = _f.read()
+                truncated = False
+                if len(content) > INJECT_PER_FILE_CAP:
+                    content = content[:INJECT_PER_FILE_CAP]
+                    truncated = True
+                if total_injected + len(content) > INJECT_TOTAL_CAP:
+                    content = content[: INJECT_TOTAL_CAP - total_injected]
+                    truncated = True
+                marker = " [TRUNCATED]" if truncated else ""
+                injected_parts.append(f"<file path=\"{fpath}\"{marker}>\n{content}\n</file>")
+                total_injected += len(content)
+                log(f"Injected {fpath} ({len(content)} chars) into initial prompt")
+            except Exception as e:
+                log(f"Could not read required file {fpath}: {e}")
+        else:
+            # File does not exist yet (to be created by the agent).
+            injected_parts.append(
+                f"<file path=\"{fpath}\" status=\"missing\">(does not exist yet - create it)</file>"
+            )
+    if not injected_parts:
+        return ""
+    return (
+        "\n\n--- UP-FRONT FILE CONTENTS (already provided — do NOT re-read these files) ---\n"
+        + "\n".join(injected_parts)
+        + "\n--- END UP-FRONT FILE CONTENTS ---\n"
     )
 
 
@@ -295,6 +716,8 @@ def build_system_prompt(issue_data: dict) -> str:
             branch_name=BRANCH_NAME,
             review_concerns=AGENT_REVIEW_CONCERNS,
             required_files_section=build_required_files_section(),
+            first_write_by_turn=FIRST_WRITE_BY_TURN,
+            max_turns=MAX_TURNS,
         )
 
     issue_summary = build_issue_summary(issue_data)
@@ -326,49 +749,82 @@ def run_agent() -> tuple[bool, int]:
     log(f"Loading issue context from {ISSUE_CONTEXT_PATH}")
     issue_data = load_issue_context(ISSUE_CONTEXT_PATH)
 
+    # Parse the required-files list (JSON-encoded) and scale max_turns for
+    # revise mode. Baseline: 25 turns for 1 file, +TURNS_PER_FILE per additional
+    # file, capped at 60. Implement mode keeps MAX_TURNS unchanged.
+    required_files_list = parse_required_files()
+    effective_max_turns = compute_effective_max_turns(required_files_list)
+    if effective_max_turns != MAX_TURNS:
+        log(f"Scaled max_turns: {MAX_TURNS} -> {effective_max_turns} ({len(required_files_list) or 1} required files)")
+
+    # Up-front file content injection for revise mode: read required files and
+    # inject their contents into the initial user message to eliminate
+    # discovery-oriented read_file/grep loops.
+    injected_file_contents = build_injected_file_contents(required_files_list) if AGENT_MODE == "revise" else ""
+
+    # Compaction ledger: tracks files read and files written across compaction
+    # events so the agent never re-reads files it already knows.
+    files_read: set[str] = set()
+    files_written: set[str] = set()
+    wrote_anything = False
+
     system_prompt = build_system_prompt(issue_data)
     log(f"System prompt built ({len(system_prompt)} chars)")
 
-    MODEL = os.environ.get("AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
-    AGENT_ESCALATION_MODEL = os.environ.get("AGENT_ESCALATION_MODEL", "deepseek/deepseek-v4-pro")
+    MODEL = os.environ.get("AGENT_MODEL", DEFAULT_MODEL)
+    AGENT_ESCALATION_MODEL = os.environ.get("AGENT_ESCALATION_MODEL", DEFAULT_ESCALATION_MODEL)
 
-    client = OpenAI(
-        api_key=API_KEY,
-        base_url=API_BASE_URL,
-        timeout=httpx.Timeout(
-            connect=30.0,  # 30s to establish connection
-            read=90.0,  # 90s max between received chunks
-            write=30.0,  # 30s to send request body
-            pool=10.0,  # 10s to acquire connection from pool
-        ),
-        max_retries=0,
-    )
-    log(f"Initialized API client: {API_BASE_URL} / model={MODEL}")
+    if AGENT_PROVIDER == "bedrock":
+        from bedrock_client import BedrockClient, assert_us_only
+
+        for _m in (MODEL, AGENT_ESCALATION_MODEL):
+            assert_us_only(_m)
+        client = BedrockClient()
+        log(f"Initialized Bedrock client: region={os.environ.get('AGENT_BEDROCK_REGION', 'us-east-2')} / model={MODEL}")
+    else:
+        client = OpenAI(
+            api_key=API_KEY,
+            base_url=API_BASE_URL,
+            timeout=httpx.Timeout(
+                connect=30.0,  # 30s to establish connection
+                read=90.0,  # 90s max between received chunks
+                write=30.0,  # 30s to send request body
+                pool=10.0,  # 10s to acquire connection from pool
+            ),
+            max_retries=0,
+        )
+        log(f"Initialized API client: {API_BASE_URL} / model={MODEL}")
 
     messages: list[dict] = [
         {"role": "system", "content": system_prompt},
     ]
     if AGENT_MODE == "revise":
+        user_content = (
+            "Address the review concerns listed in the system prompt. "
+            "Start by running git diff to see what this branch has changed, "
+            "then modify the flagged files to resolve each concern."
+        )
+        if injected_file_contents:
+            user_content += injected_file_contents
         messages.append({
             "role": "user",
-            "content": (
-                "Address the review concerns listed in the system prompt. "
-                "Start by running git diff to see what this branch has changed, "
-                "then modify the flagged files to resolve each concern."
-            ),
+            "content": user_content,
         })
     else:
+        user_content = (
+            f"Implement the changes for issue #{ISSUE_NUMBER}. "
+            "Start by exploring the repository structure, then follow the approved plan."
+        )
+        if injected_file_contents:
+            user_content += injected_file_contents
         messages.append({
             "role": "user",
-            "content": (
-                f"Implement the changes for issue #{ISSUE_NUMBER}. "
-                "Start by exploring the repository structure, then follow the approved plan."
-            ),
+            "content": user_content,
         })
 
     turns = 0
     consecutive_errors = 0
-    max_consecutive_errors = 5
+    max_consecutive_errors = 3
 
     # Stuck-loop detection: track signatures of consecutive identical failing tool calls
     repeated_fail_sigs: list[str] = []
@@ -403,14 +859,19 @@ def run_agent() -> tuple[bool, int]:
     # read-only loops where every compaction resets the counter and the
     # agent endlessly re-reads the same large file.
     compaction_resets = 0
+    # Turn on which the last compaction ran; used to extend the no-progress
+    # grace period so the nudge/abort never fire right after a compaction.
+    last_compaction_turn = 0
+    # Number of timeout hints already injected (capped at 2).
+    timeout_hints_sent = 0
 
     has_made_tool_call = False
     tool_choice_required_failed = False
 
-    while turns < MAX_TURNS:
+    while turns < effective_max_turns:
         turns += 1
         turns_since_last_write += 1
-        log(f"--- Turn {turns}/{MAX_TURNS} ---")
+        log(f"--- Turn {turns}/{effective_max_turns} ---")
 
         # Force tool use after text-only redirects to break the
         # "answers without tools" loop where the model returns text-only
@@ -424,6 +885,7 @@ def run_agent() -> tuple[bool, int]:
         signal.alarm(TURN_WALL_CLOCK_TIMEOUT)
 
         try:
+            _turn_start = time.monotonic()
             response = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
@@ -431,19 +893,39 @@ def run_agent() -> tuple[bool, int]:
                 tool_choice=effective_tool_choice,
                 temperature=0.0,
             )
+            _turn_duration_ms = (time.monotonic() - _turn_start) * 1000
         except TurnTimeoutError:
             signal.alarm(0)
             log(f"⚠ Turn {turns} exceeded {TURN_WALL_CLOCK_TIMEOUT}s wall clock timeout")
             consecutive_errors += 1
+            # On the 2nd consecutive timeout, compact the message window so the
+            # retry sends a smaller request (less likely to stall again).
+            if consecutive_errors == 2:
+                log("Compacting messages after consecutive timeout...")
+                messages = _compact_messages(messages)
             # Switch model to avoid re-hitting a stalled provider
             if MODEL == AGENT_ESCALATION_MODEL:
-                MODEL = os.environ.get("AGENT_MODEL", "deepseek/deepseek-v4-flash-0731")
+                MODEL = os.environ.get("AGENT_MODEL", DEFAULT_MODEL)
             else:
                 MODEL = AGENT_ESCALATION_MODEL
             log(f"Switched model to {MODEL} for retry")
             if consecutive_errors >= max_consecutive_errors:
                 log(f"Max consecutive errors ({max_consecutive_errors}) reached, aborting")
                 return False, turns
+            # Encourage smaller steps so the retry is less likely to stall again.
+            if timeout_hints_sent < 2:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "SYSTEM: The last request timed out. Continue in smaller "
+                            "steps: make one edit_file call (under 80 lines of new "
+                            "text) or one read_file_lines call, then continue."
+                        ),
+                    }
+                )
+                timeout_hints_sent += 1
+                log(f"Timeout hint injected ({timeout_hints_sent}/2)")
             log("Retrying in 5 seconds...")
             time.sleep(5)
             continue
@@ -466,6 +948,17 @@ def run_agent() -> tuple[bool, int]:
 
         consecutive_errors = 0
         choice = response.choices[0]
+
+        # Record per-call LLM usage (issue #980) — tokens + timing only,
+        # never message content. Uses whichever model actually served this
+        # turn (escalation can swap the model mid-run).
+        print_llm_usage(
+            model=MODEL,
+            turn=turns,
+            usage=getattr(response, "usage", None),
+            duration_ms=_turn_duration_ms,
+            finish_reason=getattr(choice, "finish_reason", None),
+        )
 
         # If the model produced a text response with no tool calls, it's done
         if choice.finish_reason == "stop" or not choice.message.tool_calls:
@@ -699,12 +1192,21 @@ def run_agent() -> tuple[bool, int]:
             wrote_since_success_reset = False
             log(f"Success-loop redirect injected (attempt {stuck_success_redirects}/2)")
 
+        # Extend the no-progress grace period after a compaction so the nudge
+        # and abort never fire within NO_PROGRESS_GRACE_TURNS turns of one.
+        # The window is anchored to the compaction turn itself (rather than
+        # computed from the remaining turns), so the checks stay silent for
+        # the full NO_PROGRESS_GRACE_TURNS turns after a mid-run compaction.
+        effective_grace = _no_progress_effective_grace(
+            last_compaction_turn, NO_PROGRESS_GRACE_TURNS
+        )
+
         # No-progress nudge: one-time warning when the agent has stalled for
         # exactly NO_PROGRESS_NUDGE_AT turns after the grace period. Equality
         # test so it fires at most once per stall; the counter resets on any
         # write and on escalation, so the nudge re-arms naturally.
         if (
-            turns > NO_PROGRESS_GRACE_TURNS
+            turns > effective_grace
             and turns_since_last_write == NO_PROGRESS_NUDGE_AT
         ):
             messages.append(
@@ -727,7 +1229,7 @@ def run_agent() -> tuple[bool, int]:
         # distinct from exit code 3 (error-loop) so the workflow can surface
         # ROOT_CAUSE: no_progress.
         if (
-            turns > NO_PROGRESS_GRACE_TURNS
+            turns > effective_grace
             and turns_since_last_write >= NO_PROGRESS_THRESHOLD
         ):
             if MODEL != AGENT_ESCALATION_MODEL:
@@ -763,6 +1265,7 @@ def run_agent() -> tuple[bool, int]:
         if total_chars > CONTEXT_BUDGET_CHARS:
             log(f"Context approaching limit ({total_chars} chars), compacting...")
             messages = _compact_messages(messages)
+            last_compaction_turn = turns
             # Reset no-progress counter: compaction drops tool results and forces the
             # agent to re-read files it had already read. Those recovery turns are
             # legitimate work, not agent inactivity, and must not count toward the
@@ -785,7 +1288,7 @@ def run_agent() -> tuple[bool, int]:
             stuck_success_redirects = 0
             log("No-progress and success-loop trackers reset after compaction")
 
-    log(f"Hit max_turns limit ({MAX_TURNS})")
+    log(f"Hit max_turns limit ({effective_max_turns})")
     return False, turns
 
 
@@ -798,6 +1301,24 @@ def _summarize_args(args: dict) -> str:
         else:
             parts.append(f"{k}={v!r}")
     return ", ".join(parts)
+
+
+def _no_progress_effective_grace(
+    last_compaction_turn: int, grace_turns: int
+) -> int:
+    """Earliest turn on which the no-progress nudge/abort may fire.
+
+    The run loop guards the nudge and abort with ``turns >
+    effective_grace``. Compaction drops tool results and forces the
+    agent to re-read files it had already read; those recovery turns are
+    legitimate work, so the checks must never fire within ``grace_turns``
+    turns of a compaction. Anchoring the window to the compaction turn
+    keeps the checks silent from the compaction up to (but excluding)
+    ``last_compaction_turn + grace_turns``. With no compaction
+    (``last_compaction_turn == 0``) this degenerates to the plain
+    startup grace period, preserving the original behavior.
+    """
+    return last_compaction_turn + grace_turns
 
 
 def _total_chars(messages: list[dict]) -> int:
@@ -818,13 +1339,21 @@ def _compact_messages(messages: list[dict]) -> list[dict]:
     Progressive, budget-aware compaction that operates on every message
     except the system prompt (messages[0]), which is always preserved.
     Reclaims space in phases, stopping as soon as the total char count
-    drops under CONTEXT_BUDGET_CHARS:
+    drops under COMPACT_TARGET_RATIO * CONTEXT_BUDGET_CHARS (headroom so
+    the next few tool results do not immediately re-trigger compaction):
 
-    1. Truncate all reclaimable messages (tool/assistant/user) to 2000 chars.
-    2. Truncate all reclaimable messages to 500 chars.
+    1. Truncate older tool messages to OLDER_TOOL_LIMIT_PHASE1 chars and
+       assistant/user messages to 2000 chars.
+    2. Truncate older tool messages to OLDER_TOOL_LIMIT_PHASE2 chars and
+       assistant/user messages to 500 chars.
     3. Drop the oldest tool messages entirely, one by one (oldest first).
     4. Truncate assistant/user messages to 200 chars.
     5. Drop the oldest assistant/user messages until the budget is met.
+
+    The most recent PROTECTED_RECENT_TOOL_MESSAGES tool messages and the
+    assistant messages that issued them are never truncated or dropped, so
+    freshly-read file content survives compaction long enough to be
+    reproduced in an edit_file(old_text=...) call.
 
     Tool output is sacrificed before assistant reasoning, and user messages
     last. If the budget still cannot be met after exhausting all reclaimable
@@ -837,9 +1366,34 @@ def _compact_messages(messages: list[dict]) -> list[dict]:
     before_chars = _total_chars(messages)
     compacted = [dict(m) for m in messages]
     reclaimable = ("tool", "assistant", "user")
+    target = int(CONTEXT_BUDGET_CHARS * COMPACT_TARGET_RATIO)
+
+    # Identify protected messages: the last PROTECTED_RECENT_TOOL_MESSAGES
+    # tool messages plus the assistant messages that issued them. Tracked by
+    # object identity so removals in later phases do not shift indices.
+    protected = set()
+    tool_positions = [
+        (i, m) for i, m in enumerate(compacted) if m.get("role") == "tool"
+    ]
+    for i, tm in tool_positions[-PROTECTED_RECENT_TOOL_MESSAGES:]:
+        protected.add(id(tm))
+        tool_call_id = tm.get("tool_call_id")
+        if not tool_call_id:
+            continue
+        for j in range(i - 1, -1, -1):
+            m = compacted[j]
+            if m.get("role") != "assistant":
+                continue
+            calls = m.get("tool_calls") or []
+            if any(
+                (c.get("id") if isinstance(c, dict) else None) == tool_call_id
+                for c in calls
+            ):
+                protected.add(id(m))
+                break
 
     def _under_budget() -> bool:
-        return _total_chars(compacted) <= CONTEXT_BUDGET_CHARS
+        return _total_chars(compacted) <= target
 
     def _finish() -> list[dict]:
         after_chars = _total_chars(compacted)
@@ -850,22 +1404,35 @@ def _compact_messages(messages: list[dict]) -> list[dict]:
         )
         return compacted
 
-    # Phase 1 — Generative truncation: shrink all reclaimable messages to 2000 chars.
+    # Phase 1 — Generative truncation: shrink older tool messages to
+    # OLDER_TOOL_LIMIT_PHASE1 chars and assistant/user messages to 2000 chars.
     for msg in compacted[1:]:
-        if msg.get("role") in reclaimable:
+        if id(msg) in protected:
+            continue
+        if msg.get("role") == "tool":
+            _truncate_content(msg, OLDER_TOOL_LIMIT_PHASE1)
+        elif msg.get("role") in ("assistant", "user"):
             _truncate_content(msg, 2000)
     if _under_budget():
         return _finish()
 
-    # Phase 2 — Aggressive truncation: shrink all reclaimable messages to 500 chars.
+    # Phase 2 — Aggressive truncation: shrink older tool messages to
+    # OLDER_TOOL_LIMIT_PHASE2 chars and assistant/user messages to 500 chars.
     for msg in compacted[1:]:
-        if msg.get("role") in reclaimable:
+        if id(msg) in protected:
+            continue
+        if msg.get("role") == "tool":
+            _truncate_content(msg, OLDER_TOOL_LIMIT_PHASE2)
+        elif msg.get("role") in ("assistant", "user"):
             _truncate_content(msg, 500)
     if _under_budget():
         return _finish()
 
-    # Phase 3 — Drop the oldest tool messages entirely (oldest first).
+    # Phase 3 — Drop the oldest tool messages entirely (oldest first),
+    # skipping protected ones.
     for msg in list(compacted[1:]):
+        if id(msg) in protected:
+            continue
         if msg.get("role") == "tool":
             compacted.remove(msg)
             if _under_budget():
@@ -873,6 +1440,8 @@ def _compact_messages(messages: list[dict]) -> list[dict]:
 
     # Phase 4 — Truncate assistant/user messages to 200 chars.
     for msg in compacted[1:]:
+        if id(msg) in protected:
+            continue
         if msg.get("role") in ("assistant", "user"):
             _truncate_content(msg, 200)
     if _under_budget():
@@ -880,6 +1449,8 @@ def _compact_messages(messages: list[dict]) -> list[dict]:
 
     # Phase 5 — Drop the oldest assistant/user messages until under budget.
     for msg in list(compacted[1:]):
+        if id(msg) in protected:
+            continue
         if msg.get("role") in ("assistant", "user"):
             compacted.remove(msg)
             if _under_budget():
@@ -889,7 +1460,7 @@ def _compact_messages(messages: list[dict]) -> list[dict]:
     log(
         f"WARNING: Compaction exhausted all reclaimable content but context is "
         f"still over budget: {_total_chars(compacted)} chars "
-        f"(threshold {CONTEXT_BUDGET_CHARS}). Budget constants need tuning."
+        f"(threshold {target}). Budget constants need tuning."
     )
     return _finish()
 
@@ -909,8 +1480,8 @@ def set_output(name: str, value: str) -> None:
 
 def main() -> None:
     log(f"DSG Coding Agent v{VERSION} starting")
-    log(f"  Model: {os.environ.get('AGENT_MODEL', 'deepseek/deepseek-v4-flash-0731')}")
-    log(f"  Escalation model: {os.environ.get('AGENT_ESCALATION_MODEL', 'deepseek/deepseek-v4-pro')}")
+    log(f"  Model: {os.environ.get('AGENT_MODEL', DEFAULT_MODEL)}")
+    log(f"  Escalation model: {os.environ.get('AGENT_ESCALATION_MODEL', DEFAULT_ESCALATION_MODEL)}")
     log(f"  API base: {API_BASE_URL}")
     log(f"  Max turns: {MAX_TURNS}")
     log(f"  Issue: #{ISSUE_NUMBER} — {ISSUE_TITLE}")
@@ -919,7 +1490,16 @@ def main() -> None:
     if AGENT_REQUIRED_FILES and AGENT_REQUIRED_FILES != "*":
         log(f"  Required files: {AGENT_REQUIRED_FILES}")
 
-    success, turns_used = run_agent()
+    try:
+        success, turns_used = run_agent()
+    finally:
+        # Publish the per-run usage summary on every exit path — including
+        # the error_loop (3) and no_progress (4) sys.exit()s raised inside
+        # run_agent — without ever masking the agent's real exit status.
+        try:
+            print_usage_summary()
+        except Exception as e:  # pragma: no cover - defensive
+            log(f"Failed to publish LLM usage summary: {e}")
 
     set_output("turns_used", str(turns_used))
 
