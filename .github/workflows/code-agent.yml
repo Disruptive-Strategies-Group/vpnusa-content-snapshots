@@ -176,6 +176,7 @@ jobs:
 
       - name: Fetch OpenRouter key from Secrets Manager
         id: creds
+        if: vars.CICD_US_ONLY != 'true'
         shell: bash
         env:
           INTEGRATIONS_SECRET_ARN: ${{ secrets.INTEGRATIONS_SECRET_ARN }}
@@ -345,12 +346,43 @@ jobs:
         timeout-minutes: 60
         uses: ./.github/actions/coding-agent
         with:
+          provider: ${{ vars.CICD_US_ONLY == 'true' && 'bedrock' || 'openai' }}
+          model: ${{ vars.CICD_US_ONLY == 'true' && 'us.anthropic.claude-haiku-5-5' || 'deepseek/deepseek-v4-flash-0731' }}
+          escalation-model: ${{ vars.CICD_US_ONLY == 'true' && 'us.anthropic.claude-sonnet-5-5' || 'deepseek/deepseek-v4-pro' }}
           api-key: ${{ env.OPENROUTER_API_KEY }}
           issue-context: .agent/issue-context.json
           branch-name: ${{ env.BRANCH_NAME }}
           issue-number: ${{ env.ISSUE_NUMBER }}
           issue-title: ${{ env.ISSUE_TITLE }}
           max-turns: "120"
+
+      - name: Publish LLM usage metrics (CloudWatch)
+        if: always() && !cancelled()
+        continue-on-error: true
+        shell: bash
+        env:
+          USAGE_JSON: ${{ steps.claude.outputs.usage-json }}
+        run: |
+          if [ -z "${USAGE_JSON:-}" ]; then
+            echo "No usage-json output from the coding agent; nothing to publish."
+            exit 0
+          fi
+          printf '%s' "${USAGE_JSON}" | jq -c '
+            [ .models[] as $m
+              | ( {MetricName:"InputTokens",Value:$m.promptTokens,Unit:"Count"},
+                  {MetricName:"OutputTokens",Value:$m.completionTokens,Unit:"Count"},
+                  {MetricName:"Calls",Value:$m.calls,Unit:"Count"},
+                  (if $m.estimatedCostUsd != null then {MetricName:"EstimatedCostUsd",Value:$m.estimatedCostUsd,Unit:"None"} else empty end) )
+                + {Dimensions:[{Name:"Role",Value:"coding_agent"},{Name:"Model",Value:$m.model}]}
+            ]' > /tmp/usage-metrics.json
+          if [ "$(jq 'length' /tmp/usage-metrics.json)" -eq 0 ]; then
+            echo "Usage summary has no models; nothing to publish."
+            exit 0
+          fi
+          aws cloudwatch put-metric-data \
+            --region us-east-2 \
+            --namespace DSG/CICD \
+            --metric-data file:///tmp/usage-metrics.json
 
       - name: Safety net - commit working tree if Claude didn't
         id: autocommit
