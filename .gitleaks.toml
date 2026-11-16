@@ -1,5 +1,8 @@
 title = "DSG Gitleaks config"
 
+# Compatible with gitleaks 8.18.4 (singular [allowlist] syntax; plural
+# [[allowlists]] requires 8.25+).
+
 [extend]
 useDefault = true
 
@@ -18,7 +21,8 @@ tags = ["key", "private-key"]
 [[rules]]
 id = "generic-api-key"
 description = "Generic API Key"
-regex = '''(?i)(?:key|api|secret|token|password|auth)[\s:=]+['"][0-9a-zA-Z\-_+/=]{20,}['"]'''
+regex = '''(?i)(?:key|api|secret|token|password|auth)['"]?[\s:=]+['"][0-9a-zA-Z\-_+/=]{20,}['"]'''
+entropy = 3.5
 tags = ["key"]
 
 [allowlist]
@@ -26,10 +30,21 @@ description = "Safe patterns that are not credentials"
 regexes = [
  "123456789012",
  "arn:aws:secretsmanager:[a-z0-9-]+:[0-9]+:secret:[a-zA-Z0-9_-]+",
+ "^12[0-9]{14}$",
 ]
 paths = [
+ # Vendored / generated build output and dependencies
+ "(^|/)\\.aws-sam/",
+ "(^|/)node_modules/",
+ "site-packages/",
+ "\\.dist-info/",
+ "(^|/)dist/",
+ "(^|/)build/",
+ # Documentation and narrow JSON allowlist (blanket *.json removed so
+ # real secrets in JSON files are still detected)
  ".*\\.md$",
- ".*\\.json$",
+ "(^|/)package-lock\\.json$",
+ "(^|/)tsconfig[^/]*\\.json$",
  "test/",
  "tests/",
  "deliverables/",
