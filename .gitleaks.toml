@@ -1,0 +1,37 @@
+title = "DSG Gitleaks config"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "aws-access-key"
+description = "AWS Access Key"
+regex = "(A3T[A-Z0-9]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[A-Z0-9]{16}"
+tags = ["key", "aws"]
+
+[[rules]]
+id = "private-key"
+description = "Private Key"
+regex = "-----BEGIN\\s+(?:RSA\\s+|DSA\\s+|EC\\s+|OPENSSH\\s+)?PRIVATE\\s+KEY-----"
+tags = ["key", "private-key"]
+
+[[rules]]
+id = "generic-api-key"
+description = "Generic API Key"
+regex = '''(?i)(?:key|api|secret|token|password|auth)[\s:=]+['"][0-9a-zA-Z\-_+/=]{20,}['"]'''
+tags = ["key"]
+
+[allowlist]
+description = "Safe patterns that are not credentials"
+regexes = [
+ "123456789012",
+ "arn:aws:secretsmanager:[a-z0-9-]+:[0-9]+:secret:[a-zA-Z0-9_-]+",
+]
+paths = [
+ ".*\\.md$",
+ ".*\\.json$",
+ "test/",
+ "tests/",
+ "deliverables/",
+ "reports/"
+]
