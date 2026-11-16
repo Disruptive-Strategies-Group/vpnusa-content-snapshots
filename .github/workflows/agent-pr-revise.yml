@@ -380,6 +380,7 @@ jobs:
       - name: Fetch OpenRouter key from Secrets Manager
         id: creds
         if: >
+          vars.CICD_US_ONLY != 'true' &&
           steps.cycle_guard.outputs.escalate != 'true' &&
           steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
@@ -409,6 +410,9 @@ jobs:
         continue-on-error: true
         uses: ./.github/actions/coding-agent
         with:
+          provider: ${{ vars.CICD_US_ONLY == 'true' && 'bedrock' || 'openai' }}
+          model: ${{ vars.CICD_US_ONLY == 'true' && 'us.anthropic.claude-haiku-5-5' || 'deepseek/deepseek-v4-flash-0731' }}
+          escalation-model: ${{ vars.CICD_US_ONLY == 'true' && 'us.anthropic.claude-sonnet-5-5' || 'deepseek/deepseek-v4-pro' }}
           api-key: ${{ env.OPENROUTER_API_KEY }}
           issue-context: .agent/issue-context.json
           branch-name: ${{ steps.meta.outputs.head_ref }}
@@ -417,6 +421,34 @@ jobs:
           mode: revise
           review-concerns: ${{ steps.concerns.outputs.concerns }}
           required-files: ${{ steps.feedback_parse.outputs.required_files }}
+
+      - name: Publish LLM usage metrics (CloudWatch)
+        if: always() && steps.claude.outcome != 'skipped'
+        continue-on-error: true
+        shell: bash
+        env:
+          USAGE_JSON: ${{ steps.claude.outputs.usage-json }}
+        run: |
+          if [ -z "${USAGE_JSON:-}" ]; then
+            echo "No usage-json output from the coding agent; nothing to publish."
+            exit 0
+          fi
+          printf '%s' "${USAGE_JSON}" | jq -c '
+            [ .models[] as $m
+              | ( {MetricName:"InputTokens",Value:$m.promptTokens,Unit:"Count"},
+                  {MetricName:"OutputTokens",Value:$m.completionTokens,Unit:"Count"},
+                  {MetricName:"Calls",Value:$m.calls,Unit:"Count"},
+                  (if $m.estimatedCostUsd != null then {MetricName:"EstimatedCostUsd",Value:$m.estimatedCostUsd,Unit:"None"} else empty end) )
+                + {Dimensions:[{Name:"Role",Value:"coding_agent"},{Name:"Model",Value:$m.model}]}
+            ]' > /tmp/usage-metrics.json
+          if [ "$(jq 'length' /tmp/usage-metrics.json)" -eq 0 ]; then
+            echo "Usage summary has no models; nothing to publish."
+            exit 0
+          fi
+          aws cloudwatch put-metric-data \
+            --region us-east-2 \
+            --namespace DSG/CICD \
+            --metric-data file:///tmp/usage-metrics.json
 
       - name: Warn if Claude Code failed
         if: >
@@ -443,12 +475,55 @@ jobs:
               ].join('\n')
             });
 
+      - name: Escalate on agent failure
+        if: >
+          steps.cycle_guard.outputs.escalate != 'true' &&
+          steps.blocked_check.outputs.blocked != 'true' &&
+          steps.concerns.outputs.no_concerns != 'true' &&
+          steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.claude.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          retries: 3
+          retry-exempt-status-codes: 400,401,404,422
+          script: |
+            const { owner, repo } = context.repo;
+            const prNumber = Number('${{ steps.meta.outputs.pr_number }}');
+
+            // Apply the blocking label so future CHANGES_REQUESTED runs exit early.
+            try {
+              await github.rest.issues.addLabels({
+                owner, repo, issue_number: prNumber,
+                labels: ['blocked:non-substantive']
+              });
+            } catch (e) {
+              core.warning(`Could not add blocked:non-substantive label: ${e.message}`);
+            }
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: [
+                '<!-- AGENT_VERDICT --> ESCALATE — The revision agent failed and produced no code changes.',
+                '',
+                '**Failure reason:** `${{ steps.claude.outcome }}` (see the [workflow run logs](' +
+                  `https://github.com/${owner}/${repo}/actions/runs/${{ github.run_id }}` +
+                  ')).',
+                '',
+                'No commit was pushed and this failed run was **not counted** against the revision quota.',
+                '',
+                'The PR has been labelled `blocked:non-substantive`. An admin must remove the',
+                'label before further automatic revision cycles can run.'
+              ].join('\n')
+            });
+
       - name: Safety-net commit and cleanup
         if: >
           steps.cycle_guard.outputs.escalate != 'true' &&
           steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
-          steps.feedback_parse.outputs.no_files != 'true'
+          steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.claude.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -533,7 +608,7 @@ jobs:
           steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
           steps.feedback_parse.outputs.no_files != 'true' &&
-          steps.claude.outcome == 'success'
+          steps.claude.outcome != 'skipped'
         id: substantive
         shell: bash
         env:
@@ -611,6 +686,7 @@ jobs:
           steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
           steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.claude.outcome != 'failure' &&
           steps.substantive.outputs.non_substantive == 'true'
         uses: actions/github-script@v7
         env:
@@ -666,6 +742,7 @@ jobs:
           steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
           steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.claude.outcome == 'success' &&
           steps.substantive.outputs.non_substantive == 'false'
         uses: actions/github-script@v7
         with:
@@ -711,6 +788,7 @@ jobs:
           steps.blocked_check.outputs.blocked != 'true' &&
           steps.concerns.outputs.no_concerns != 'true' &&
           steps.feedback_parse.outputs.no_files != 'true' &&
+          steps.claude.outcome == 'success' &&
           steps.substantive.outputs.non_substantive != 'true'
         uses: actions/github-script@v7
         env:
