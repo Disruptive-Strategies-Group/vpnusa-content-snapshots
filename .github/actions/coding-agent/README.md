@@ -24,6 +24,28 @@ A composite GitHub Action that runs an LLM-powered coding agent inside a workflo
 |--------|-------------|
 | `outcome` | `success` if the agent completed normally, `failure` if it hit max_turns or errored. |
 | `turns_used` | Number of agentic loop turns consumed. |
+| `exit-code` | `agent.py` exit code: `0`=ok, `3`=error_loop, `4`=no_progress, other=agent_error. |
+| `usage-json` | JSON summary of per-model LLM token usage, call counts and estimated cost (USD) for the run; empty when no LLM call succeeded. |
+
+## LLM usage tracking
+
+Every completion is recorded on stdout as a JSON line prefixed `LLM_USAGE ` (fields
+`role`, `mode`, `model`, `turn`, `promptTokens`, `completionTokens`, `cachedTokens`,
+`durationMs`, `finishReason`; message content is never logged). At the end of the run —
+including on `error_loop` and `no_progress` exits — one `LLM_USAGE_SUMMARY ` JSON line
+is printed with per-model totals plus `estimatedCostUsd` (unknown models report `null`),
+and the same summary is exposed as the `usage-json` output and as a table appended to
+`$GITHUB_STEP_SUMMARY`.
+
+Callers (e.g. `code-agent.yml`, `agent-pr-revise.yml`, `agent-design-qa.yml`) publish the
+usage to CloudWatch under namespace `DSG/CICD` with dimensions `Role` and `Model`
+(metrics `InputTokens`, `OutputTokens`, `EstimatedCostUsd`, `Calls`) — the same schema as
+the Lambda-side `llm_usage` message in dsg-agentic-assistant-compute#594, so both runtimes
+can be queried together. Publish failures never fail a run.
+
+> **Propagation**: changes to this action (or to `code-agent.yml` /
+> `agent-pr-revise.yml` / `agent-design-qa.yml`) reach other repositories only when
+> `org-deploy-agent.yml` is run manually. Verify on a single-repo canary first.
 
 ## Tools available to the agent
 
