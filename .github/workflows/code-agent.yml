@@ -341,10 +341,18 @@ jobs:
       - name: Prepare agent stdout log
         run: touch /tmp/agent-stdout.log
 
+      - name: Stage coding-agent action outside the checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ../coding-agent-runtime
+          mkdir -p ../coding-agent-runtime
+          cp -a .github/actions/coding-agent/. ../coding-agent-runtime/
+
       - name: Agent implements approved plan (edit → commit only)
         id: claude
         timeout-minutes: 60
-        uses: ./.github/actions/coding-agent
+        uses: ./../coding-agent-runtime
         with:
           provider: ${{ vars.CICD_US_ONLY == 'true' && 'bedrock' || 'openai' }}
           model: ${{ vars.CICD_US_ONLY == 'true' && 'us.anthropic.claude-haiku-5-5' || 'deepseek/deepseek-v4-flash-0731' }}
