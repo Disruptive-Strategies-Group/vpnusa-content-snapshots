@@ -422,6 +422,7 @@ jobs:
               // Read the issue's comments to find its per-issue required_sets
               let issueRequiredSets = null;
               let issueExpectedWorkflows = null;
+              let issueMergeSha = null;
               try {
                 const comments = await github.rest.issues.listComments({
                   owner, repo, issue_number: issueNum, per_page: 100
@@ -430,6 +431,7 @@ jobs:
                 for (const c of [...comments.data].reverse()) {
                   if (!c.body.startsWith('DSG-LIFECYCLE:')) continue;
                   const meta = parseMetadata(c.body);
+                  issueMergeSha = meta?.merge_sha || null;
                   if (meta?.required_sets) {
                     try { issueRequiredSets = JSON.parse(meta.required_sets); } catch {}
                   } else if (meta?.expected_workflows) {
@@ -470,8 +472,22 @@ jobs:
                 return;
               }
 
-              const { completed, blocked, pending } = await computeSetResolution(cfg, setsToCheck, headSha);
-              console.log(`Issue #${issueNum}: head_sha=${headSha}, completed=${JSON.stringify(completed)}, blocked=${JSON.stringify(blocked)}, pending=${JSON.stringify(pending)}`);
+              const headRes = await computeSetResolution(cfg, setsToCheck, headSha);
+              // A set is done if it succeeded on the issue's own merge SHA OR on HEAD.
+              // Without this, a set that only ran on the merge SHA stays pending forever
+              // once later merges touch only a subset of the required paths.
+              let mergeRes = { completed: [], blocked: [], pending: [] };
+              if (issueMergeSha && issueMergeSha !== headSha) {
+                mergeRes = await computeSetResolution(cfg, setsToCheck, issueMergeSha);
+              }
+              const completed = setsToCheck.filter(s => headRes.completed.includes(s) || mergeRes.completed.includes(s));
+              const blocked = setsToCheck.filter(s => !completed.includes(s) &&
+                (headRes.blocked.includes(s) || mergeRes.blocked.includes(s)));
+              const pending = setsToCheck.filter(s => !completed.includes(s) && !blocked.includes(s));
+              const shaLog = issueMergeSha && issueMergeSha !== headSha
+                ? `head_sha=${headSha}, merge_sha=${issueMergeSha}`
+                : `head_sha=${headSha}`;
+              console.log(`Issue #${issueNum}: ${shaLog}, completed=${JSON.stringify(completed)}, blocked=${JSON.stringify(blocked)}, pending=${JSON.stringify(pending)}`);
 
               if (blocked.length > 0) {
                 const failedWf = ((cfg.sets[blocked[0]] || {}).workflows || [])[0] || blocked[0];
