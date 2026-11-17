@@ -92,8 +92,12 @@ runs:
       run: |
         set -euo pipefail
         pip install --quiet "openai>=1.30.0" "httpx>=0.23.0"
+        python3 -m venv "${RUNNER_TEMP}/agent-venv"
+        "${RUNNER_TEMP}/agent-venv/bin/pip" install --quiet "openai>=1.30.0" "httpx>=0.23.0"
         if [ "${{ inputs.provider }}" = "bedrock" ]; then
-          pip install --quiet "boto3>=1.35.0"
+          pip install --quiet "boto3>=1.37.24"
+          "${RUNNER_TEMP}/agent-venv/bin/pip" install --quiet "boto3>=1.37.24"
+          "${RUNNER_TEMP}/agent-venv/bin/python" "${{ github.action_path }}/check_bedrock_cache.py"
         fi
 
     - name: Install test dependencies (if any)
@@ -162,7 +166,7 @@ runs:
         set -euo pipefail
         set +e
         export PYTHONPATH="${{ github.action_path }}${AGENT_EXTRA_PYTHONPATH:+:${AGENT_EXTRA_PYTHONPATH}}"
-        python3 "${{ github.action_path }}/agent.py" 2>&1 | tee -a /tmp/agent-stdout.log
+        "${RUNNER_TEMP}/agent-venv/bin/python" "${{ github.action_path }}/agent.py" 2>&1 | tee -a /tmp/agent-stdout.log
         rc=${PIPESTATUS[0]}
         set -e
         echo "exit_code=${rc}" >> "$GITHUB_OUTPUT"
