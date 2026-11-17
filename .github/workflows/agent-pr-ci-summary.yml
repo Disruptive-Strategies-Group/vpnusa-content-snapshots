@@ -373,10 +373,15 @@ jobs:
                 : cleaned.slice(0, max) + '\n...[truncated]';
             }
 
+            // Returns { status: 'no_match' | 'fetch_error' | 'empty' | 'ok', text, error }
             async function fetchJobLogs(entry) {
-              if (entry.type !== 'check_run' || !entry.details_url) return null;
-              const match = entry.details_url.match(/\/actions\/runs\/(\d+)\/jobs\/(\d+)/);
-              if (!match) return null;
+              if (entry.type !== 'check_run' || !entry.details_url) return { status: 'no_match', text: '', error: '' };
+              // GitHub returns both /actions/runs/<run>/job/<job> and /actions/runs/<run>/jobs/<job>
+              const match = entry.details_url.match(/\/actions\/runs\/(\d+)\/jobs?\/(\d+)/);
+              if (!match) {
+                core.warning(`fetchJobLogs: details_url did not match: ${entry.details_url}`);
+                return { status: 'no_match', text: '', error: '' };
+              }
               const run_id = Number(match[1]);
               const job_id = Number(match[2]);
               try {
@@ -384,18 +389,52 @@ jobs:
                   owner, repo, run_id, job_id
                 });
                 const logText = resp.data;
-                if (!logText) return null;
+                if (!logText) return { status: 'empty', text: '', error: '' };
                 if (typeof logText !== 'string') {
-                  core.warning(`fetchJobLogs: unexpected resp.data type '${typeof logText}' for job_id=${job_id}`);
-                  return null;
+                  const msg = `unexpected resp.data type '${typeof logText}'`;
+                  core.warning(`fetchJobLogs: ${msg} for job_id=${job_id}`);
+                  return { status: 'fetch_error', text: '', error: msg };
                 }
                 core.info(`fetchJobLogs: retrieved ${logText.length} chars for job_id=${job_id}`);
-                const lines = logText.split('\n');
-                return lines.slice(-80).join('\n');
+                const extracted = extractFailureText(logText);
+                if (!extracted) return { status: 'empty', text: '', error: '' };
+                return { status: 'ok', text: extracted, error: '' };
               } catch (e) {
                 core.warning(`fetchJobLogs: failed for job_id=${job_id}: ${e.message}`);
-                return null;
+                return { status: 'fetch_error', text: '', error: e.message };
               }
+            }
+
+            // Pull the failure-relevant parts out of a raw job log:
+            // ##[error] lines, pytest "short test summary info", and the pytest "FAILURES" section.
+            // Falls back to the log tail when none of those are present.
+            function extractFailureText(logText) {
+              const stripTs = (l) => l.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, '').replace(/\r$/, '');
+              const lines = logText.split('\n').map(stripTs);
+              const isBanner = (l) => /^={3,} .+ ={3,}\s*$/.test(l);
+              const sectionOf = (headerRe) => {
+                const start = lines.findIndex((l) => headerRe.test(l));
+                if (start === -1) return [];
+                const out = [];
+                for (let i = start + 1; i < lines.length; i++) {
+                  if (isBanner(lines[i])) break;
+                  out.push(lines[i]);
+                }
+                return out;
+              };
+
+              const errorLines = lines.filter((l) => l.includes('##[error]')).map((l) => l.replace(/^.*##\[error\]/, '##[error]'));
+              const summary = sectionOf(/^={3,} short test summary info ={3,}\s*$/);
+              const failures = sectionOf(/^={3,} FAILURES ={3,}\s*$/);
+
+              const parts = [];
+              if (errorLines.length) parts.push(errorLines.join('\n'));
+              if (summary.length) parts.push('=== short test summary info ===\n' + summary.join('\n').trim());
+              if (failures.length) parts.push('=== FAILURES ===\n' + failures.join('\n').trim());
+              if (parts.length) return parts.join('\n\n');
+
+              const tail = lines.slice(-80).join('\n').trim();
+              return tail;
             }
 
             const summaryLines = [];
@@ -447,17 +486,23 @@ jobs:
                 summaryLines.push(`### ${entry.name}`);
                 summaryLines.push('');
                 let rawText = entry.text || entry.summary || '';
+                let limit = 1500;
                 if (!rawText && entry.type === 'check_run') {
                   const fetched = await fetchJobLogs(entry);
-                  if (fetched) {
-                    rawText = fetched;
+                  if (fetched.status === 'ok') {
+                    rawText = fetched.text;
+                    limit = 6000;
+                  } else if (fetched.status === 'no_match') {
+                    rawText = 'No failure text was surfaced by GitHub for this check. Log fetch skipped: details_url did not match the expected /actions/runs/<run>/job/<job> form.';
+                  } else if (fetched.status === 'fetch_error') {
+                    rawText = `No failure text was surfaced by GitHub for this check. Log fetch failed: ${fetched.error || 'unknown error'}.`;
                   } else {
-                    rawText = 'No failure text was surfaced by GitHub for this check. Log fetch was attempted but unavailable.';
+                    rawText = 'No failure text was surfaced by GitHub for this check. Job log was fetched but contained no failure text.';
                   }
                 } else if (!rawText) {
                   rawText = 'No failure text was surfaced by GitHub for this check.';
                 }
-                const text = trimText(rawText);
+                const text = trimText(rawText, limit);
                 summaryLines.push('```text');
                 summaryLines.push(text);
                 summaryLines.push('```');
