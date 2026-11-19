@@ -266,6 +266,12 @@ jobs:
                 return terminalStates.has(entry.status);
               }
 
+              // A check run that already has a terminal conclusion is complete,
+              // even when GitHub leaves its status field as in_progress.
+              if (entry.conclusion && terminalStates.has(entry.conclusion)) {
+                return true;
+              }
+
               if (!entry.status || entry.status === 'completed') {
                 return terminalStates.has(entry.conclusion || 'success');
               }
@@ -290,6 +296,10 @@ jobs:
               return ['failure', 'timed_out', 'cancelled', 'action_required'].includes(value);
             }
 
+            function isBlocking(entry) {
+              return isPending(entry) || !isTerminal(entry);
+            }
+
             const pending = allEntries.filter(isPending);
             let failures = allEntries.filter(isFailure);
 
@@ -308,7 +318,7 @@ jobs:
               const elapsed = Date.now() - pollStart;
               if (elapsed >= POLL_TIMEOUT_MS) {
                 // Escalate: post a comment on the PR so Owen is alerted
-                const pendingNames = allEntries.filter(isPending).map(e => e.name).join(', ');
+                const pendingNames = allEntries.filter(isBlocking).map(e => `${e.name} (${e.status || 'n/a'}/${e.conclusion || 'none'})`).join(', ') || 'none (no entries reported as blocking)';
                 await github.rest.issues.createComment({
                   owner,
                   repo,
@@ -329,7 +339,7 @@ jobs:
                 return;
               }
 
-              core.info(`Not all checks terminal (pending: ${allEntries.filter(isPending).length}/${allEntries.length}). Waiting ${POLL_INTERVAL_MS / 1000}s before retry... (elapsed: ${Math.round(elapsed / 1000)}s)`);
+              core.info(`Not all checks terminal (blocking: ${allEntries.filter(isBlocking).length}/${allEntries.length}). Waiting ${POLL_INTERVAL_MS / 1000}s before retry... (elapsed: ${Math.round(elapsed / 1000)}s)`);
               await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
 
               // Re-fetch checks for head SHA
