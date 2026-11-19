@@ -20,6 +20,13 @@ from types import SimpleNamespace
 
 _CACHE_FAMILIES = ("anthropic", "nova")
 _NO_TEMPERATURE_FAMILIES = ("anthropic",)  # Claude 5.x on Bedrock rejects `temperature`
+_BLANK_TEXT = "(empty)"
+
+
+def _non_blank(value) -> str:
+    """Converse rejects empty and whitespace-only text blocks; return a non-blank placeholder instead."""
+    text = "" if value is None else str(value)
+    return text if text.strip() else _BLANK_TEXT
 
 
 def supports_cache(model: str) -> bool:
@@ -42,14 +49,14 @@ def to_converse_messages(messages: list[dict], cache: bool = False) -> tuple[lis
     for m in messages:
         role = m.get("role")
         if role == "system":
-            if m.get("content"):
+            if m.get("content") and str(m["content"]).strip():
                 system.append({"text": m["content"]})
             continue
         if role == "user":
-            r, blocks = "user", [{"text": m.get("content") or " "}]
+            r, blocks = "user", [{"text": _non_blank(m.get("content"))}]
         elif role == "assistant":
             r, blocks = "assistant", []
-            if m.get("content"):
+            if m.get("content") and str(m["content"]).strip():
                 blocks.append({"text": m["content"]})
             for tc in m.get("tool_calls") or []:
                 try:
@@ -60,11 +67,11 @@ def to_converse_messages(messages: list[dict], cache: bool = False) -> tuple[lis
                     inp = {}
                 blocks.append({"toolUse": {"toolUseId": tc["id"], "name": tc["function"]["name"], "input": inp}})
             if not blocks:
-                blocks = [{"text": " "}]
+                blocks = [{"text": _BLANK_TEXT}]
         elif role == "tool":
             r = "user"
             blocks = [{"toolResult": {"toolUseId": m["tool_call_id"],
-                                      "content": [{"text": str(m.get("content") or " ")}]}}]
+                                      "content": [{"text": _non_blank(m.get("content"))}]}}]
         else:
             continue
         if out and out[-1]["role"] == r:
@@ -118,7 +125,8 @@ class _Message:
 
 def from_converse_response(r: dict):
     blocks = r["output"]["message"]["content"]
-    text = "".join(b["text"] for b in blocks if "text" in b) or None
+    text = "".join(b["text"] for b in blocks if "text" in b)
+    text = text if text.strip() else None
     calls = [SimpleNamespace(id=b["toolUse"]["toolUseId"], type="function",
                              function=SimpleNamespace(name=b["toolUse"]["name"],
                                                       arguments=json.dumps(b["toolUse"].get("input") or {})))
