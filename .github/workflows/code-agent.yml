@@ -958,6 +958,30 @@ jobs:
                 return;
               }
 
+              // A failed implement run must not block an issue whose branch already has a live PR
+              // (produced by an earlier implement run on the same issue, e.g. duplicate /agent approve).
+              if (implementResult === 'failure' && !branchAdvanced) {
+                const headRef = owner + ':' + process.env.BRANCH_NAME;
+                let existingPr = null;
+                try {
+                  const prs = await github.paginate(github.rest.pulls.list, {
+                    owner, repo, head: headRef, state: 'all', per_page: 20
+                  });
+                  existingPr = prs.find(p => p.state === 'open' || p.merged_at) || null;
+                } catch (e) {
+                  existingPr = null;
+                }
+                if (existingPr) {
+                  await github.rest.issues.createComment({
+                    owner, repo, issue_number,
+                    body: 'A later implement run ended without new edits (Root cause: ' + failureReason + '), but branch ' +
+                      process.env.BRANCH_NAME + ' already has PR #' + existingPr.number + ' (' +
+                      (existingPr.merged_at ? 'merged' : 'open') + '). The issue title was left unchanged.\n\nFull workflow log: ' + runUrl
+                  });
+                  return;
+                }
+              }
+
               const newTitle = RED + ' [AGENT:BLOCKED] ' + stripAllPrefixes(currentTitle);
               try { await github.rest.issues.update({ owner, repo, issue_number, title: newTitle }); } catch (e) {}
               await github.rest.issues.createComment({
