@@ -34,6 +34,7 @@ import json
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 
@@ -744,6 +745,30 @@ def build_system_prompt(issue_data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _repo_has_agent_changes(base_ref: str = "origin/main") -> bool:
+    """True when the working tree has uncommitted changes, or HEAD has commits
+    that are not on the base branch. Changes under .agent/ are ignored.
+    Never raises; any git failure returns False.
+    """
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.splitlines()
+        for line in status:
+            path = line[3:].strip()
+            if path and not path.startswith(".agent/"):
+                return True
+        ahead = subprocess.run(
+            ["git", "rev-list", "--count", f"{base_ref}..HEAD"],
+            capture_output=True, text=True, timeout=30,
+        ).stdout.strip()
+        return ahead.isdigit() and int(ahead) > 0
+    except Exception:
+        return False
+
+
+
 def run_agent() -> tuple[bool, int]:
     """Run the agentic loop. Returns (success: bool, turns_used: int)."""
     log(f"Loading issue context from {ISSUE_CONTEXT_PATH}")
@@ -962,8 +987,11 @@ def run_agent() -> tuple[bool, int]:
 
         # If the model produced a text response with no tool calls, it's done
         if choice.finish_reason == "stop" or not choice.message.tool_calls:
+            # Git state check: the agent may have changed files via bash
+            # (cp + git commit) instead of edit_file/write_file.
+            repo_changed = _repo_has_agent_changes()
             # Redirect text-only responses when no edits have been made yet
-            if not has_attempted_edit and text_only_redirects < max_text_only_redirects:
+            if not (has_attempted_edit or repo_changed) and text_only_redirects < max_text_only_redirects:
                 text_only_redirects += 1
                 log(
                     f"Agent returned text-only without making any edits "
@@ -987,9 +1015,11 @@ def run_agent() -> tuple[bool, int]:
             # If the model never made any edits, return failure (not success)
             # so the workflow correctly reports BLOCKED instead of masking
             # the no-op as a successful run.
-            if not has_attempted_edit:
+            if not (has_attempted_edit or repo_changed):
                 log("Agent returned text-only without making any edits (all redirects exhausted)")
                 return False, turns
+            if not has_attempted_edit:
+                log("Agent finished with changes made outside edit_file/write_file (bash); treating as success")
             if choice.message.content:
                 log(f"Agent finished: {choice.message.content[:200]}")
             else:
